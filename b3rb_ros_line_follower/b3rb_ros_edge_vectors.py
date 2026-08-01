@@ -28,10 +28,9 @@ RED_COLOR = (0, 0, 255)
 BLUE_COLOR = (255, 0, 0)
 GREEN_COLOR = (0, 255, 0)
 
-# HINT: You can adjust what percentage of the image from the bottom is analyzed.
-# Lower portions are closer to the buggy, while upper portions see further ahead.
-VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.225
-VECTOR_MAGNITUDE_MINIMUM = 2.25
+# Analyzing lower 35% of the frame for immediate lane orientation ahead of the buggy
+VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.35
+VECTOR_MAGNITUDE_MINIMUM = 5.0
 
 class EdgeVectorsPublisher(Node):
     """
@@ -91,106 +90,102 @@ class EdgeVectorsPublisher(Node):
     def compute_vectors_from_image(self, image, thresh):
         """
         Analyzes the binary threshold image and extracts left and right lane edge vectors.
-        This uses basic contour finding and coordinates calculations.
-        
-        You can optimize this algorithm or implement alternative methods here.
         """
-        # Find contours around black edge stripes detected in the binary threshold image.
         contours = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
 
         vectors = []
+        rover_point = [self.image_width / 2.0, self.lower_image_height]
+
         for i in range(len(contours)):
             coordinates = contours[i][:, 0, :]
+            if len(coordinates) < 5:
+                continue
 
-            # Get coordinates representing the boundaries of the contour
             min_y_value = np.min(coordinates[:, 1])
             max_y_value = np.max(coordinates[:, 1])
 
-            min_y_coords = np.array(coordinates[coordinates[:, 1] == min_y_value])
-            max_y_coords = np.array(coordinates[coordinates[:, 1] == max_y_value])
+            min_y_coords = coordinates[coordinates[:, 1] == min_y_value]
+            max_y_coords = coordinates[coordinates[:, 1] == max_y_value]
 
-            min_y_coord = min_y_coords[0]
-            max_y_coord = max_y_coords[0]
+            min_y_coord = np.array(min_y_coords[0], dtype=float)
+            max_y_coord = np.array(max_y_coords[0], dtype=float)
 
             # Calculate contour vector magnitude
             magnitude = np.linalg.norm(min_y_coord - max_y_coord)
-            if (magnitude > VECTOR_MAGNITUDE_MINIMUM):
-                # Calculate distance from the camera center at the bottom of the crop
-                rover_point = [self.image_width / 2, self.lower_image_height]
-                middle_point = (min_y_coord + max_y_coord) / 2
+            if magnitude > VECTOR_MAGNITUDE_MINIMUM:
+                middle_point = (min_y_coord + max_y_coord) / 2.0
                 distance = np.linalg.norm(middle_point - rover_point)
 
-                # Correct point coordinates based on vector slope angle
                 angle = self.get_vector_angle_in_radians([min_y_coord, max_y_coord])
                 if angle > 0:
-                    min_y_coord[0] = np.max(min_y_coords[:, 0])
+                    min_y_coord[0] = float(np.max(min_y_coords[:, 0]))
                 else:
-                    max_y_coord[0] = np.max(max_y_coords[:, 0])
+                    max_y_coord[0] = float(np.max(max_y_coords[:, 0]))
 
-                # Store vectors with distance metadata for sorting
                 vectors.append([list(min_y_coord), list(max_y_coord), distance])
 
-            # Draw all detected raw vectors in blue on the debug image
-            cv2.line(image, tuple(min_y_coord), tuple(max_y_coord), BLUE_COLOR, 2)
+                # Draw raw candidate vectors in blue
+                cv2.line(
+                    image, 
+                    (int(min_y_coord[0]), int(min_y_coord[1])), 
+                    (int(max_y_coord[0]), int(max_y_coord[1])), 
+                    BLUE_COLOR, 2
+                )
 
         return vectors, image
 
     def process_image_for_edge_vectors(self, image):
         """
-        Applies basic preprocessing (Grayscale + Thresholding) and extracts lane vectors.
-        
-        OPTIMIZATION HINTS:
-        - White road with 2 black boundaries: Gray-level thresholding is highly sensitive to lighting.
-          You can try converting the image to HSV or LAB color space to isolate the black lane boundaries
-          more reliably under different lighting conditions.
-        - Inverse Perspective Mapping (IPM) / Perspective Warp: Transforming the image into a 
-          "birds-eye view" before processing makes steering math linear and much easier to calculate.
-        - Regions of Interest (ROI): Make sure to filter out the sky, horizon, or the buggy's own chassis
-          to avoid spurious noise.
-        - Sliding Windows / Polynomial Fitting: Instead of simple lines, you could fit a quadratic curve
-          (y = Ax^2 + Bx + C) to handle bends, curves, and intersections more smoothly.
+        Applies HSV thresholding and extracts left/right lane vectors cleanly.
         """
         self.image_height, self.image_width, _ = image.shape
         self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
         self.upper_image_height = int(self.image_height - self.lower_image_height)
 
-        # 1. Convert to Grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # 1. Convert to HSV color space for better resilience against shadow/lighting
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        # 2. Binary Thresholding (aiming to isolate the black stripes of the track)
-        # Note: In the simulation, black stripes will result in low intensity values (close to 0).
-        threshold_black = 25
-        thresh = cv2.threshold(gray, threshold_black, 255, cv2.THRESH_BINARY_INV)[1]
+        # 2. Thresholding for dark black lane border stripes
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 60])
+        thresh = cv2.inRange(hsv, lower_black, upper_black)
 
-        # 3. Crop the image to focus on the lower section close to the buggy
-        thresh_cropped = thresh[self.image_height - self.lower_image_height:]
-        image_cropped = image[self.image_height - self.lower_image_height:].copy()
+        # Clean noise using morphological opening/closing
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-        # 4. Compute vectors from the binary image contours
+        # 3. Crop ROI to lower portion of the image
+        thresh_cropped = thresh[self.upper_image_height:].copy()
+        image_cropped = image[self.upper_image_height:].copy()
+
+        # 4. Compute vectors from binary contours
         vectors, debug_img = self.compute_vectors_from_image(image_cropped, thresh_cropped)
 
-        # 5. Sort vectors based on distance from buggy (we prioritize vectors closer to us)
+        # 5. Sort vectors by proximity to the rover
         vectors = sorted(vectors, key=lambda x: x[2])
 
-        # 6. Split vectors based on left/right halves of the image
-        half_width = self.image_width / 2
-        vectors_left = [v for v in vectors if ((v[0][0] + v[1][0]) / 2) < half_width]
-        vectors_right = [v for v in vectors if ((v[0][0] + v[1][0]) / 2) >= half_width]
+        # 6. Separate left and right vectors
+        half_width = self.image_width / 2.0
+        vectors_left = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) < half_width]
+        vectors_right = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) >= half_width]
 
         final_vectors = []
-        # Select the closest vector from each side (left/right)
         for side_vectors in [vectors_left, vectors_right]:
             if len(side_vectors) > 0:
                 best_vector = side_vectors[0]
-                # Draw the selected key lane vector in green on the debug image
-                cv2.line(debug_img, tuple(best_vector[0]), tuple(best_vector[1]), GREEN_COLOR, 2)
                 
-                # Transform coordinates back to the original uncropped image space
-                best_vector[0][1] += self.upper_image_height
-                best_vector[1][1] += self.upper_image_height
-                final_vectors.append(best_vector[:2])
+                # Draw key lane boundary in green
+                p1 = (int(best_vector[0][0]), int(best_vector[0][1]))
+                p2 = (int(best_vector[1][0]), int(best_vector[1][1]))
+                cv2.line(debug_img, p1, p2, GREEN_COLOR, 2)
 
-        # Publish visual debugging images (viewable in tools like Foxglove)
+                # Map y-coordinates back to global frame space
+                v_copy = [
+                    [best_vector[0][0], best_vector[0][1] + self.upper_image_height],
+                    [best_vector[1][0], best_vector[1][1] + self.upper_image_height]
+                ]
+                final_vectors.append(v_copy)
+
         self.publish_debug_image(self.publisher_thresh_image, thresh_cropped)
         self.publish_debug_image(self.publisher_vector_image, debug_img)
 
@@ -198,19 +193,20 @@ class EdgeVectorsPublisher(Node):
 
     def camera_image_callback(self, message):
         """Processes incoming camera frames and publishes detected EdgeVectors."""
-        # Convert compressed image message to OpenCV format
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
+        if image is None:
+            return
+
         vectors = self.process_image_for_edge_vectors(image)
 
-        # Construct and publish the ROS 2 EdgeVectors message
         vectors_message = EdgeVectors()
         vectors_message.image_height = image.shape[0]
         vectors_message.image_width = image.shape[1]
         vectors_message.vector_count = 0
 
-        # Vector 1 (usually representing Left boundary)
+        # Vector 1 (Left Boundary)
         if len(vectors) > 0:
             vectors_message.vector_1[0].x = float(vectors[0][0][0])
             vectors_message.vector_1[0].y = float(vectors[0][0][1])
@@ -218,7 +214,7 @@ class EdgeVectorsPublisher(Node):
             vectors_message.vector_1[1].y = float(vectors[0][1][1])
             vectors_message.vector_count += 1
 
-        # Vector 2 (usually representing Right boundary)
+        # Vector 2 (Right Boundary)
         if len(vectors) > 1:
             vectors_message.vector_2[0].x = float(vectors[1][0][0])
             vectors_message.vector_2[0].y = float(vectors[1][0][1])
