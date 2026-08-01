@@ -15,49 +15,46 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
-from synapse_msgs.msg import EdgeVectors, Steering, ServerCommunication
-
 import math
+from sensor_msgs.msg import Joy, LaserScan
+from std_msgs.msg import String
+from synapse_msgs.msg import EdgeVectors, ServerCommunication
 
 QOS_PROFILE_DEFAULT = 10
 
-# Driving Parameters
-CRUISE_SPEED = 1.2       # Base speed on straight paths (m/s)
-MIN_SPEED = 0.5          # Speed during tight turns (m/s)
-MAX_STEER_ANGLE = 0.5    # Maximum steering angle limit (radians)
-KP_STEER = 0.0035        # Proportional Gain for steering control
-SINGLE_LANE_OFFSET = 120 # Pixel offset from a single lane boundary to road center
+# Driving Bounds for Joy Interface [-1.0, 1.0]
+CRUISE_SPEED = 0.25      # Base forward speed (Range: 0.0 to 1.0)
+MIN_SPEED = 0.10         # Turning speed (Range: 0.0 to 1.0)
+MAX_STEER = 0.8          # Steering angle limit (Range: -1.0 to 1.0)
+KP_STEER = 0.0035        # Proportional Steering Gain
+SINGLE_LANE_OFFSET = 120 # Pixel offset when only 1 lane is detected
 
 class LineFollower(Node):
     """
-    ROS 2 Node that receives lane vectors, LIDAR, server commands, and traffic signs
-    to control the buggy's velocity and steering.
+    Core controller Node for the B3RB buggy that receives vision, LIDAR, and server feedback 
+    and outputs motor commands via sensor_msgs/Joy on /cerebri/in/joy.
     """
     def __init__(self):
         super().__init__('line_follower')
 
-        # Steering control variables
-        self.target_speed = 0.0
+        # ------------------ Driving Targets ------------------
+        self.target_speed = CRUISE_SPEED
         self.target_turn = 0.0
 
-        # State Machine Variable (Prepared for Phase 4)
-        self.current_state = "LANE_FOLLOWING"
-
-        # Publishers
-        self.publisher_cmd_vel = self.create_publisher(
-            Steering,
-            '/cmd_vel',
+        # ------------------ Publishers ------------------
+        # Joy publisher required by Cerebri motor controller
+        self.publisher_joy = self.create_publisher(
+            Joy,
+            '/cerebri/in/joy',
             QOS_PROFILE_DEFAULT)
 
-        self.publisher_server_comm = self.create_publisher(
+        self.publisher_server = self.create_publisher(
             ServerCommunication,
-            '/server_data_ack',
+            '/ServerCommunication',
             QOS_PROFILE_DEFAULT)
 
-        # Subscribers
-        self.subscription_edge_vectors = self.create_subscription(
+        # ------------------ Subscriptions ------------------
+        self.subscription_vectors = self.create_subscription(
             EdgeVectors,
             '/edge_vectors',
             self.edge_vectors_callback,
@@ -69,30 +66,41 @@ class LineFollower(Node):
             self.lidar_callback,
             QOS_PROFILE_DEFAULT)
 
-        self.subscription_object_recog = self.create_subscription(
-            String,
-            '/sign_board_detection',
-            self.object_recog_callback,
-            QOS_PROFILE_DEFAULT)
-
-        self.subscription_qr_detector = self.create_subscription(
-            String,
-            '/qr_code_detection',
-            self.qr_code_callback,
-            QOS_PROFILE_DEFAULT)
-
-        self.subscription_server_comm = self.create_subscription(
+        self.subscription_server = self.create_subscription(
             ServerCommunication,
-            '/server_data_receive',
+            '/ServerCommunication',
             self.server_communication_callback,
             QOS_PROFILE_DEFAULT)
 
-        # Command Loop Timer (Runs at 20 Hz / 50ms)
-        self.timer = self.create_timer(0.05, self.control_loop)
+        self.subscription_qr = self.create_subscription(
+            String,
+            '/qr_detection',
+            self.qr_detection_callback,
+            QOS_PROFILE_DEFAULT)
+
+        self.subscription_signs = self.create_subscription(
+            String,
+            '/sign_board_detection',
+            self.sign_board_callback,
+            QOS_PROFILE_DEFAULT)
+
+        # Timer to publish drive commands at 10Hz (100ms)
+        self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
+
+        self.get_logger().info("B3RB Line Follower initialized & listening on /cerebri/in/joy.")
+
+    def publish_drive_commands(self):
+        """Timer callback that periodically sends motor control packets to Cerebri."""
+        msg = Joy()
+        # Buttons array keeps buggy in autonomous mode
+        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  
+        # axes = [0.0, speed, 0.0, turn]
+        msg.axes = [0.0, float(self.target_speed), 0.0, float(self.target_turn)]
+        self.publisher_joy.publish(msg)
 
     def edge_vectors_callback(self, message):
         """
-        Calculates steering error and adjusts speed based on incoming edge vectors.
+        Calculates horizontal error and updates target steering and speed.
         """
         img_width = message.image_width
         if img_width == 0:
@@ -100,67 +108,51 @@ class LineFollower(Node):
 
         rover_center_x = img_width / 2.0
         target_center_x = rover_center_x
-
         vector_count = message.vector_count
 
         if vector_count == 2:
-            # Both left and right lane boundaries detected -> calculate midpoint
+            # Dual lines: Calculate middle target
             left_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
             right_x = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
             target_center_x = (left_x + right_x) / 2.0
 
         elif vector_count == 1:
-            # Single lane boundary detected -> apply fixed horizontal offset
+            # Single line fallback
             detected_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
             if detected_x < rover_center_x:
-                # Left lane detected -> aim to the right of it
                 target_center_x = detected_x + SINGLE_LANE_OFFSET
             else:
-                # Right lane detected -> aim to the left of it
                 target_center_x = detected_x - SINGLE_LANE_OFFSET
-
         else:
-            # No lane detected -> maintain current direction safely
             target_center_x = rover_center_x
 
-        # Calculate horizontal pixel deviation from road center
+        # Calculate pixel deviation
         error_x = target_center_x - rover_center_x
 
-        # Proportional Steering Control
+        # Proportional Steering Calculation
         raw_turn = -KP_STEER * error_x
-        self.target_turn = max(-MAX_STEER_ANGLE, min(MAX_STEER_ANGLE, raw_turn))
+        self.target_turn = max(-MAX_STEER, min(MAX_STEER, raw_turn))
 
-        # Adaptive Speed: Slow down on sharp turns, accelerate on straight paths
-        turn_severity = abs(self.target_turn) / MAX_STEER_ANGLE
-        self.target_speed = CRUISE_SPEED * (1.0 - 0.6 * turn_severity)
+        # Adaptive Speed: Slow down on turns
+        turn_severity = abs(self.target_turn) / MAX_STEER
+        self.target_speed = CRUISE_SPEED * (1.0 - 0.5 * turn_severity)
         self.target_speed = max(MIN_SPEED, self.target_speed)
 
     def lidar_callback(self, message):
-        """Placeholder for LIDAR processing (Phase 3)."""
-        pass
-
-    def object_recog_callback(self, message):
-        """Placeholder for sign board handling (Phase 3)."""
-        pass
-
-    def qr_code_callback(self, message):
-        """Placeholder for QR code parsing (Phase 2)."""
+        """Placeholder for Phase 3 Obstacle Avoidance."""
         pass
 
     def server_communication_callback(self, message):
-        """Placeholder for Municipality Server messages (Phase 2)."""
+        """Placeholder for Phase 2 Server Communication."""
         pass
 
-    def control_loop(self):
-        """Publishes the computed speed and turn angle to the vehicle's actuators."""
-        steering_msg = Steering()
-        steering_msg.solar_panel_ctl = 0.0
+    def qr_detection_callback(self, message):
+        """Placeholder for Phase 2 QR Detection."""
+        pass
 
-        # Assign targets computed from vision/navigation callbacks
-        steering_msg.speed = float(self.target_speed)
-        steering_msg.steering_angle = float(self.target_turn)
-
-        self.publisher_cmd_vel.publish(steering_msg)
+    def sign_board_callback(self, message):
+        """Placeholder for Phase 3 Sign Recognition."""
+        pass
 
 def main(args=None):
     rclpy.init(args=args)
@@ -171,10 +163,10 @@ def main(args=None):
         pass
     finally:
         # Emergency stop on exit
-        stop_msg = Steering()
-        stop_msg.speed = 0.0
-        stop_msg.steering_angle = 0.0
-        node.publisher_cmd_vel.publish(stop_msg)
+        stop_msg = Joy()
+        stop_msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
+        stop_msg.axes = [0.0, 0.0, 0.0, 0.0]
+        node.publisher_joy.publish(stop_msg)
         
         node.destroy_node()
         rclpy.shutdown()

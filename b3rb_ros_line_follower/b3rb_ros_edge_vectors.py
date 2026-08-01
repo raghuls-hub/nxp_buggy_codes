@@ -20,6 +20,26 @@ import numpy as np
 import cv2
 import math
 from synapse_msgs.msg import EdgeVectors
+# raghul@Raghul-s-TUF:~$ ros2 run b3rb_ros_line_follower runner
+# Traceback (most recent call last):
+#   File "/home/raghul/cognipilot/cranium/install/b3rb_ros_line_follower/lib/b3rb_ros_line_follower/runner", line 33, in <module>
+#     sys.exit(load_entry_point('b3rb-ros-line-follower==0.0.0', 'console_scripts', 'runner')())
+#   File "/home/raghul/cognipilot/cranium/install/b3rb_ros_line_follower/lib/b3rb_ros_line_follower/runner", line 25, in importlib_load_entry_point
+#     return next(matches).load()
+#   File "/usr/lib/python3.10/importlib/metadata/__init__.py", line 171, in load
+#     module = import_module(match.group('module'))
+#   File "/usr/lib/python3.10/importlib/__init__.py", line 126, in import_module
+#     return _bootstrap._gcd_import(name[level:], package, level)
+#   File "<frozen importlib._bootstrap>", line 1050, in _gcd_import
+#   File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+#   File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+#   File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+#   File "<frozen importlib._bootstrap_external>", line 883, in exec_module
+#   File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+#   File "/home/raghul/cognipilot/cranium/install/b3rb_ros_line_follower/lib/python3.10/site-packages/b3rb_ros_line_follower/b3rb_ros_line_follower.py", line 20, in <module>
+#     from synapse_msgs.msg import EdgeVectors, Steering, ServerCommunication
+# ImportError: cannot import name 'Steering' from 'synapse_msgs.msg' (/home/raghul/cognipilot/cranium/install/synapse_msgs/local/lib/python3.10/dist-packages/synapse_msgs/msg/__init__.py)
+# [ros2run]: Process exited with failure 1
 
 QOS_PROFILE_DEFAULT = 10
 PI = math.pi
