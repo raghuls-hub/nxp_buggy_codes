@@ -1,4 +1,5 @@
 # Copyright 2024-2026 NXP
+# Copyright 2016 Open Source Robotics Foundation, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,81 +17,66 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+
 import cv2
 import numpy as np
 
-# HINT: If you want to use pyzbar for QR code detection, you can install it using:
-# pip install pyzbar
-# And uncomment/import it here:
-# try:
-#     from pyzbar import pyzbar
-# except ImportError:
-#     pyzbar = None
+QOS_PROFILE_DEFAULT = 10
 
 class QRDetector(Node):
     """
-    ROS 2 Node that processes raw camera images to scan for QR codes.
-    It publishes the detected QR code payload on the `/qr_detection` topic.
+    ROS 2 Node that receives compressed camera feeds, detects and decodes QR codes,
+    and publishes detected string payloads onto /qr_detection.
     """
     def __init__(self):
         super().__init__('qr_detector')
 
-        # Subscription for camera images.
-        self.subscription_camera = self.create_subscription(
-            CompressedImage,
-            '/camera/image_raw/compressed',
-            self.camera_image_callback,
-            10)
+        # Last detected payload to prevent duplicate continuous flooding
+        self.last_qr_data = ""
 
-        # Publisher for QR code detection results.
+        # Publisher for detected QR code strings
         self.publisher_qr = self.create_publisher(
             String,
             '/qr_detection',
-            10)
+            QOS_PROFILE_DEFAULT)
 
-        self.get_logger().info("QR Detector Node started. Waiting for images...")
+        # Subscriber for camera compressed images
+        self.subscription_image = self.create_subscription(
+            CompressedImage,
+            '/camera/image_raw/compressed',
+            self.image_callback,
+            QOS_PROFILE_DEFAULT)
 
-    def camera_image_callback(self, message):
-        """Processes incoming camera frames to detect QR codes."""
-        # Convert compressed image message to OpenCV format
-        np_arr = np.frombuffer(message.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        # OpenCV QR Code Detector Instance
+        self.qr_detector = cv2.QRCodeDetector()
 
-        qr_data = self.detect_qr_code(image)
+        self.get_logger().info("QR Detector Node Initialized and listening to camera.")
 
-        if qr_data is not None:
-            # Publish the decoded QR payload
-            msg = String()
-            msg.data = qr_data
-            self.publisher_qr.publish(msg)
-            self.get_logger().info(f"Published QR Data: {qr_data}")
-
-    def detect_qr_code(self, image):
-        """
-        Detect and decode QR code in the image.
-        
-        OPTIMIZATION HINTS:
-        - OpenCV has a built-in QR Code detector: cv2.QRCodeDetector().
-        - Alternatively, you can use Pyzbar (a popular and robust library for barcode/QR code reading).
-        - Ensure to pre-process the image (e.g., convert to grayscale, thresholding, cropping to region 
-          of interest where the building/QR board is expected to appear) to improve speed and reliability.
-        """
-        # --- Method 1: Using OpenCV Built-in QR Detector ---
+    def image_callback(self, message):
+        """Processes compressed image frames and searches for readable QR codes."""
         try:
-            detector = cv2.QRCodeDetector()
-            data, bbox, straight_qrcode = detector.detectAndDecode(image)
-            if bbox is not None and data != "":
-                return data
+            # Convert compressed image bytes to OpenCV BGR image
+            np_arr = np.frombuffer(message.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+            if cv_image is None:
+                return
+
+            # Detect and decode QR Code
+            qr_data, points, _ = self.qr_detector.detectAndDecode(cv_image)
+
+            if qr_data:
+                # Publish newly detected QR string payload
+                qr_msg = String()
+                qr_msg.data = str(qr_data)
+                self.publisher_qr.publish(qr_msg)
+
+                if qr_data != self.last_qr_data:
+                    self.get_logger().info(f"🔍 Scanned QR Code: '{qr_data}'")
+                    self.last_qr_data = qr_data
+
         except Exception as e:
-            self.get_logger().debug(f"OpenCV QR Detection failed: {e}")
-
-        # --- Method 2: Placeholder for Pyzbar ---
-        # if pyzbar is not None:
-        #     decoded_objects = pyzbar.decode(image)
-        #     for obj in decoded_objects:
-        #         return obj.data.decode('utf-8')
-
-        return None
+            self.get_logger().error(f"Error processing QR image: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
