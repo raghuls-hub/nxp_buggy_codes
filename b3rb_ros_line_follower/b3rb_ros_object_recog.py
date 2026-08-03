@@ -1,113 +1,90 @@
 # Copyright 2024-2026 NXP
 # Copyright 2016 Open Source Robotics Foundation, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
-from synapse_msgs.msg import ServerCommunication
 
 import cv2
 import numpy as np
-from collections import deque, Counter
+import sys
+from collections import Counter
 
 QOS_PROFILE_DEFAULT = 10
-BUGGY_ID = 1
 
-WARP_SIZE = 200                  # 200x200 pixels normalized top-down ROI
-MIN_WHITE_AREA_THRESHOLD = 300   # Min cumulative white area to reject REAR_FACE boards
+WARP_SIZE = 200                  # Normalized ROI canvas size
+MIN_WHITE_AREA_THRESHOLD = 250   # Min white pixel area to classify as FRONT board
+MIN_GREEN_CONTOUR_AREA = 1000    # Green contour area threshold
+REQUIRED_CONTINUOUS_FRAMES = 8   # Frames required to lock onto a front board
+
+# Spatial ROI Boundaries (Fraction of Frame Dimensions)
+ROI_ENTRY_FRAC  = 0.05           # Top Y boundary
+ROI_EXIT_FRAC   = 0.90           # Bottom Y boundary
+ROI_X_LEFT_FRAC = 0.22           # Left X boundary (Ignores left-lane signboards)
+ROI_X_RIGHT_FRAC= 0.78           # Right X boundary (Ignores right-lane signboards)
+
 
 class ObjectRecognizer(Node):
     """
-    ROS 2 Node for Upgraded Signboard Detection:
-    - Stage A: Perspective Normalization to 200x200 canvas.
-    - Stage B: Rear-Facing Signboard Rejection via cumulative white pixel area.
-    - Stage C: Sub-panel Geometric Arrow Classification (Centroid Skewness).
-    - Stage D: Temporal Voting Buffer (N=10 sliding window, >= 60% majority threshold).
-    - Publishes debug visuals to /debug_images/sign_board_contours.
+    ROS 2 Node for Junction Signboard Detection:
+    - Constrained X/Y ROI bounding box to focus exclusively on current lane signboards.
+    - Pauses detection automatically when buggy enters TURNING mode.
+    - Locks onto front-facing boards and publishes direction payload upon crossing.
     """
     def __init__(self):
         super().__init__('object_recognizer')
 
-        self.current_target_letter = None
-        self.last_emitted_direction = ""
+        # Mode Tracking
+        self.current_driving_mode = "DUAL_CENTERING"
 
-        # Stage D: Temporal Voting Buffer setup
-        self.voting_buffer_size = 10
-        self.voting_threshold = 0.60
-        self.direction_buffer = deque(maxlen=self.voting_buffer_size)
+        # Detection State Machine Flags
+        self.continuous_frame_count = 0
+        self.is_board_locked = False
+        self.last_centroid_y = 0.0
 
-        # ------------------ Publishers ------------------
+        # Internal Direction Storage Buffer
+        self.direction_votes = []
+
+        # Publishers
         self.publisher_signs = self.create_publisher(
-            String,
-            '/sign_board_detection',
-            QOS_PROFILE_DEFAULT)
-
+            String, '/sign_board_detection', QOS_PROFILE_DEFAULT)
         self.publisher_debug_img = self.create_publisher(
-            CompressedImage,
-            '/debug_images/sign_board_contours',
-            QOS_PROFILE_DEFAULT)
+            CompressedImage, '/debug_images/sign_board_contours', QOS_PROFILE_DEFAULT)
 
-        # ------------------ Subscriptions ------------------
-        self.subscription_image = self.create_subscription(
-            CompressedImage,
-            '/camera/image_raw/compressed',
-            self.image_callback,
-            QOS_PROFILE_DEFAULT)
+        # Subscriptions
+        self.create_subscription(
+            CompressedImage, '/camera/image_raw/compressed', self.image_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(
+            String, '/driving_mode', self.driving_mode_callback, QOS_PROFILE_DEFAULT)
 
-        self.subscription_server = self.create_subscription(
-            ServerCommunication,
-            '/ServerCommunication',
-            self.server_callback,
-            QOS_PROFILE_DEFAULT)
+        self.get_logger().info("🚦 ROI-Constrained Signboard Recognizer Operational.")
 
-        self.get_logger().info("Upgraded Signboard Recognizer (Rear Rejection + Perspective + Voting) Initialized.")
-
-    def server_callback(self, message):
-        """Extracts active target letter from server messages."""
-        if message.dest == BUGGY_ID and message.msg != "" and message.ack == 0:
-            if message.msg not in ["OK", "INVALID", "PARKED"]:
-                payload = message.msg.strip()
-                self.current_target_letter = payload.split('_')[-1]
-                self.get_logger().info(f"🎯 Target letter updated: '{self.current_target_letter}'")
-
-    # ------------------ STAGE A: Perspective Normalization ------------------
+    def driving_mode_callback(self, msg):
+        """Disables/Enables signboard detection depending on driving mode."""
+        new_mode = msg.data.strip().upper()
+        if new_mode != self.current_driving_mode:
+            self.current_driving_mode = new_mode
+            if self.current_driving_mode == "TURNING":
+                self.get_logger().info("⏸️ TURNING mode active: Signboard detection PAUSED.")
+                self.reset_detection_state()
+            else:
+                self.get_logger().info("▶️ DUAL_CENTERING mode active: Signboard detection RESUMED.")
 
     def order_points(self, pts):
-        """Orders points: top-left, top-right, bottom-right, bottom-left."""
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
         rect[2] = pts[np.argmax(s)]
-
         diff = np.diff(pts, axis=1)
         rect[1] = pts[np.argmin(diff)]
         rect[3] = pts[np.argmax(diff)]
         return rect
 
     def warp_signboard_roi(self, image, cnt):
-        """Applies perspective transformation to produce a 200x200 top-down view."""
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-        if len(approx) == 4:
-            pts = approx.reshape(4, 2)
-        else:
-            rect_rot = cv2.minAreaRect(cnt)
-            pts = cv2.boxPoints(rect_rot)
-
+        pts = approx.reshape(4, 2) if len(approx) == 4 else cv2.boxPoints(cv2.minAreaRect(cnt))
         rect = self.order_points(pts)
 
         dst = np.array([
@@ -117,13 +94,9 @@ class ObjectRecognizer(Node):
             [0, WARP_SIZE - 1]], dtype="float32")
 
         M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(image, M, (WARP_SIZE, WARP_SIZE))
-        return warped
-
-    # ------------------ STAGE C: Geometric Arrow Classification ------------------
+        return cv2.warpPerspective(image, M, (WARP_SIZE, WARP_SIZE))
 
     def classify_arrow_direction(self, arrow_cnt, w_box, h_box):
-        """Classifies arrow direction using geometric centroid skewness."""
         if h_box > 1.2 * w_box:
             return "STRAIGHT"
 
@@ -131,115 +104,164 @@ class ObjectRecognizer(Node):
             M = cv2.moments(arrow_cnt)
             if M["m00"] != 0:
                 cx = M["m10"] / M["m00"]
-                if cx < (w_box / 2.0):
-                    return "LEFT"
-                else:
-                    return "RIGHT"
+                return "LEFT" if cx < (w_box / 2.0) else "RIGHT"
 
         return "STRAIGHT"
 
-    def process_warped_signboard(self, warped_roi):
-        """Processes 200x200 ROI for rear rejection (Stage B) and arrow classification (Stage C)."""
-        gray = cv2.cvtColor(warped_roi, cv2.COLOR_BGR2GRAY)
-        _, white_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    def inspect_and_extract_board(self, cv_image, cnt):
+        try:
+            warped_roi = self.warp_signboard_roi(cv_image, cnt)
+            gray = cv2.cvtColor(warped_roi, cv2.COLOR_BGR2GRAY)
+            _, white_mask = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)
 
-        # STAGE B: Rear-Facing Signboard Rejection
-        total_white_area = cv2.countNonZero(white_mask)
-        if total_white_area < MIN_WHITE_AREA_THRESHOLD:
-            return "REAR_FACE", total_white_area
+            total_white_area = cv2.countNonZero(white_mask)
 
-        # STAGE C: Lower Sub-Panel Arrow Analysis (y >= 100)
-        white_cnts, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if total_white_area < MIN_WHITE_AREA_THRESHOLD:
+                return False, None, warped_roi
 
-        arrows = []
-        for w_cnt in white_cnts:
-            if cv2.contourArea(w_cnt) > 60:
-                wx, wy, ww, wh = cv2.boundingRect(w_cnt)
-                if wy >= (WARP_SIZE * 0.5):
-                    direction = self.classify_arrow_direction(w_cnt, ww, wh)
-                    arrows.append({'dir': direction, 'x': wx})
+            white_cnts, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            arrows = []
+            for w_cnt in white_cnts:
+                if cv2.contourArea(w_cnt) > 40:
+                    wx, wy, ww, wh = cv2.boundingRect(w_cnt)
+                    if wy >= (WARP_SIZE * 0.35):
+                        direction = self.classify_arrow_direction(w_cnt, ww, wh)
+                        arrows.append({'dir': direction, 'x': wx})
 
-        if arrows:
-            arrows.sort(key=lambda a: a['x'])
-            return arrows[0]['dir'], total_white_area
+            if arrows:
+                arrows.sort(key=lambda a: a['x'])
+                return True, arrows[0]['dir'], warped_roi
 
-        return None, total_white_area
+            return True, "STRAIGHT", warped_roi
 
-    # ------------------ MAIN CALLBACK (STAGES A - D) ------------------
+        except Exception as e:
+            return False, None, None
+
+    def publish_resultant_direction(self):
+        if not self.direction_votes:
+            self.reset_detection_state()
+            return
+
+        counts = Counter(self.direction_votes)
+        most_common, freq = counts.most_common(1)[0]
+        confidence = (freq / len(self.direction_votes)) * 100.0
+
+        msg = String()
+        msg.data = most_common
+        self.publisher_signs.publish(msg)
+
+        banner = (
+            "\n" + "═" * 68 + "\n"
+            f"  🎯 FRONT SIGNBOARD PASSED -> RESULTANT DIRECTION PUBLISHED\n"
+            f"  🧭 Direction Payload : [{most_common}]\n"
+            f"  📊 Voting Consensus  : {freq}/{len(self.direction_votes)} samples ({confidence:.1f}%)\n"
+            + "═" * 68 + "\n"
+        )
+        print(banner, flush=True)
+        sys.stdout.flush()
+        self.get_logger().info(f"Published direction [{most_common}] to topic /sign_board_detection")
+
+        self.reset_detection_state()
+
+    def reset_detection_state(self):
+        self.continuous_frame_count = 0
+        self.is_board_locked = False
+        self.direction_votes.clear()
 
     def image_callback(self, message):
         try:
             np_arr = np.frombuffer(message.data, np.uint8)
             cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
             if cv_image is None:
                 return
 
+            h_full, w_full = cv_image.shape[:2]
             debug_img = cv_image.copy()
 
-            # Green Mask Isolation
+            # Define Spatial ROI Window (Center-Lane Focused)
+            roi_top_y   = int(h_full * ROI_ENTRY_FRAC)
+            roi_bot_y   = int(h_full * ROI_EXIT_FRAC)
+            roi_left_x  = int(w_full * ROI_X_LEFT_FRAC)
+            roi_right_x = int(w_full * ROI_X_RIGHT_FRAC)
+
+            # Draw ROI Bounding Window
+            cv2.rectangle(debug_img, (roi_left_x, roi_top_y), (roi_right_x, roi_bot_y), (255, 255, 0), 2)
+
+            # ── IF BUGGY IS TURNING: SUPPRESS DETECTION ──
+            if self.current_driving_mode == "TURNING":
+                cv2.putText(debug_img, "DETECTION PAUSED (TURNING MODE)", (roi_left_x + 10, roi_top_y + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                self.publish_debug_image(debug_img)
+                return
+
+            # Color Thresholding
             hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-            lower_green = np.array([35, 50, 50])
+            lower_green = np.array([35, 40, 40])
             upper_green = np.array([85, 255, 255])
             green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
             contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_contours = [c for c in contours if cv2.contourArea(c) > MIN_GREEN_CONTOUR_AREA]
 
-            raw_frame_direction = None
-            is_rear_facing = False
+            front_boards = []
+            rear_board_count = 0
 
-            for cnt in contours:
-                if cv2.contourArea(cnt) > 5000:
-                    x, y, bw, bh = cv2.boundingRect(cnt)
-                    cv2.rectangle(debug_img, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            for cnt in valid_contours:
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                cx = x + (bw / 2.0)
+                cy = y + (bh / 2.0)
 
-                    # Stage A: Warp ROI
-                    warped_roi = self.warp_signboard_roi(cv_image, cnt)
+                # Filter strictly within current lane X and Y spatial bounds
+                if (roi_top_y <= cy <= roi_bot_y) and (roi_left_x <= cx <= roi_right_x):
+                    is_front, dir_extracted, warped_roi = self.inspect_and_extract_board(cv_image, cnt)
 
-                    # Stage B & C: Process ROI
-                    direction_res, white_area = self.process_warped_signboard(warped_roi)
-
-                    if direction_res == "REAR_FACE":
-                        is_rear_facing = True
-                        cv2.putText(debug_img, "REAR FACE REJECTED", (x, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    if is_front:
+                        front_boards.append((cnt, dir_extracted, warped_roi, cy, (x, y, bw, bh)))
                     else:
-                        raw_frame_direction = direction_res
+                        rear_board_count += 1
+                        cv2.rectangle(debug_img, (x, y), (x + bw, y + bh), (0, 0, 255), 1)
 
-                    # Draw Warped ROI on debug canvas
-                    debug_img[0:WARP_SIZE, 0:WARP_SIZE] = warped_roi
-                    cv2.rectangle(debug_img, (0, 0), (WARP_SIZE, WARP_SIZE), (255, 255, 0), 2)
-                    break
+            if front_boards:
+                best_front = max(front_boards, key=lambda item: cv2.contourArea(item[0]))
+                cnt, dir_res, warped_roi, cy, (bx, by, bw, bh) = best_front
+                self.last_centroid_y = cy
 
-            # Stage D: Temporal Voting Buffer Logic
-            if raw_frame_direction and not is_rear_facing:
-                self.direction_buffer.append(raw_frame_direction)
-            elif is_rear_facing or raw_frame_direction is None:
-                if len(self.direction_buffer) > 0:
-                    self.direction_buffer.clear()
-                    self.last_emitted_direction = ""
+                cv2.rectangle(debug_img, (bx, by), (bx + bw, by + bh), (0, 255, 0), 3)
 
-            # Majority Voting Consensus Check
-            if len(self.direction_buffer) >= (self.voting_buffer_size // 2):
-                counts = Counter(self.direction_buffer)
-                most_common, freq = counts.most_common(1)[0]
-                consensus_ratio = freq / len(self.direction_buffer)
+                if not self.is_board_locked:
+                    self.continuous_frame_count += 1
+                    self.get_logger().info(
+                        f"STAGE 1: Front Board Locked ({self.continuous_frame_count}/{REQUIRED_CONTINUOUS_FRAMES})")
 
-                cv2.putText(debug_img, f"Vote: {most_common} ({freq}/{len(self.direction_buffer)})",
-                            (WARP_SIZE + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    if self.continuous_frame_count >= REQUIRED_CONTINUOUS_FRAMES:
+                        self.is_board_locked = True
+                        self.get_logger().info("🔒 STAGE 1 LOCKED: Front signboard verified!")
 
-                if consensus_ratio >= self.voting_threshold and most_common != self.last_emitted_direction:
-                    self.last_emitted_direction = most_common
-                    msg = String()
-                    msg.data = most_common
-                    self.publisher_signs.publish(msg)
-                    self.get_logger().info(f"🚦 Majority Vote Triggered -> Direction: '{most_common}' ({consensus_ratio*100:.1f}%)")
+                if self.is_board_locked:
+                    if dir_res is not None:
+                        self.direction_votes.append(dir_res)
+                        cv2.putText(debug_img, f"FRONT: {dir_res} ({len(self.direction_votes)} votes)",
+                                    (bx, by - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # Publish Debug Frame
+                    if warped_roi is not None:
+                        debug_img[0:WARP_SIZE, 0:WARP_SIZE] = warped_roi
+
+            else:
+                if not self.is_board_locked and self.continuous_frame_count > 0:
+                    self.continuous_frame_count -= 1
+
+                if self.is_board_locked:
+                    self.get_logger().info("🚪 STAGE 3 TRIGGERED: Front signboard crossed!")
+                    self.publish_resultant_direction()
+
+            status_text = f"LOCK: {self.continuous_frame_count}/{REQUIRED_CONTINUOUS_FRAMES}" if not self.is_board_locked else f"LOCKED ({len(self.direction_votes)} votes)"
+            cv2.putText(debug_img, status_text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 0) if self.is_board_locked else (0, 165, 255), 2)
+
             self.publish_debug_image(debug_img)
 
         except Exception as e:
-            self.get_logger().error(f"Error in signboard processing pipeline: {e}")
+            self.get_logger().error(f"Error in signboard recognizer: {e}")
 
     def publish_debug_image(self, cv_img):
         try:
@@ -251,6 +273,7 @@ class ObjectRecognizer(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to publish debug image: {e}")
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = ObjectRecognizer()
@@ -261,6 +284,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

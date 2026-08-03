@@ -1,252 +1,358 @@
 # Copyright 2024-2026 NXP
 # Copyright 2016 Open Source Robotics Foundation, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-import numpy as np
+from std_msgs.msg import String
+from synapse_msgs.msg import EdgeVectors, ServerCommunication
+
 import cv2
-import math
-from synapse_msgs.msg import EdgeVectors
-# raghul@Raghul-s-TUF:~$ ros2 run b3rb_ros_line_follower runner
-# Traceback (most recent call last):
-#   File "/home/raghul/cognipilot/cranium/install/b3rb_ros_line_follower/lib/b3rb_ros_line_follower/runner", line 33, in <module>
-#     sys.exit(load_entry_point('b3rb-ros-line-follower==0.0.0', 'console_scripts', 'runner')())
-#   File "/home/raghul/cognipilot/cranium/install/b3rb_ros_line_follower/lib/b3rb_ros_line_follower/runner", line 25, in importlib_load_entry_point
-#     return next(matches).load()
-#   File "/usr/lib/python3.10/importlib/metadata/__init__.py", line 171, in load
-#     module = import_module(match.group('module'))
-#   File "/usr/lib/python3.10/importlib/__init__.py", line 126, in import_module
-#     return _bootstrap._gcd_import(name[level:], package, level)
-#   File "<frozen importlib._bootstrap>", line 1050, in _gcd_import
-#   File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
-#   File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
-#   File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
-#   File "<frozen importlib._bootstrap_external>", line 883, in exec_module
-#   File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
-#   File "/home/raghul/cognipilot/cranium/install/b3rb_ros_line_follower/lib/python3.10/site-packages/b3rb_ros_line_follower/b3rb_ros_line_follower.py", line 20, in <module>
-#     from synapse_msgs.msg import EdgeVectors, Steering, ServerCommunication
-# ImportError: cannot import name 'Steering' from 'synapse_msgs.msg' (/home/raghul/cognipilot/cranium/install/synapse_msgs/local/lib/python3.10/dist-packages/synapse_msgs/msg/__init__.py)
-# [ros2run]: Process exited with failure 1
+import numpy as np
+import json
 
 QOS_PROFILE_DEFAULT = 10
-PI = math.pi
 
-RED_COLOR = (0, 0, 255)
-BLUE_COLOR = (255, 0, 0)
-GREEN_COLOR = (0, 255, 0)
+# ── ROI & Partition Parameters ────────────────────────────────────────────────
+ROI_TOP_FRAC       = 0.40  # Horizon start for straight vectors
+ROI_BOTTOM_FRAC    = 0.90  # Horizon end for straight vectors
 
-# Analyzing lower 35% of the frame for immediate lane orientation ahead of the buggy
-VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.35
-VECTOR_MAGNITUDE_MINIMUM = 5.0
+# Parabola Lower ROI Parameters (Filters top noise)
+PARABOLA_ROI_TOP   = 0.55  # Lower 45% of image for curve extraction
+PARABOLA_ROI_BOT   = 0.92  # Bottom limit
+BORDER_STRIP_PX    = 5
 
-class EdgeVectorsPublisher(Node):
+MIN_CONTOUR_AREA   = 150   # Minimum px² contour area
+MIN_CONTOUR_HEIGHT = 12    # Minimum vertical span in pixels
+
+# Color Segmentation Thresholds for Black Lines
+LANE_BLACK_HSV_LOWER = np.array([0, 0, 0])
+LANE_BLACK_HSV_UPPER = np.array([180, 255, 95])
+LAB_L_MAX_THRESHOLD  = 85
+
+# Polyline & Parabola Parameters
+SLIDING_STRIPS       = 10
+MIN_POLY_POINTS      = 4
+POLY_SAMPLE_POINTS   = 10
+LOOKAHEAD_Y_PIXEL    = 340 # Y evaluation point for turning parabola
+
+BUGGY_ID = 1
+
+
+def contour_vertical_span(contour):
+    y = contour[:, 0, 1]
+    return int(np.max(y)) - int(np.min(y))
+
+
+def get_centroid_x(contour):
+    return float(np.mean(contour[:, 0, 0]))
+
+
+def contour_centroids_by_strip(contour, n_bins: int):
+    """Extracts strip centroids along a contour for clean curve fitting."""
+    pts_x = contour[:, 0, 0].astype(float)
+    pts_y = contour[:, 0, 1].astype(float)
+    y_min, y_max = pts_y.min(), pts_y.max()
+    span = y_max - y_min
+    if span < 1:
+        return []
+    bin_h = span / n_bins
+    centroids = []
+    for i in range(n_bins):
+        lo, hi = y_min + i * bin_h, y_min + (i + 1) * bin_h
+        mask = (pts_y >= lo) & (pts_y < hi)
+        if mask.sum() > 0:
+            centroids.append((float(np.mean(pts_x[mask])), float(np.mean(pts_y[mask]))))
+    centroids.sort(key=lambda p: p[1])
+    return centroids
+
+
+class EdgeVectorsNode(Node):
     """
-    ROS 2 Node that processes raw camera images to detect the lane edges (left/right bounds).
-    It publishes the detected boundaries as synapse_msgs/EdgeVectors.
+    ROS 2 Perception Node:
+    - Dual-lane edge vector extraction for straight driving (/edge_vectors, /edge_curves)
+    - Dedicated Parabola Extractor using lower ROI contours (/turning_parabola)
+    - Fully gated by Server Communication start state.
     """
     def __init__(self):
-        super().__init__('edge_vectors_publisher')
+        super().__init__('edge_vectors')
 
-        # Subscription for camera images.
-        self.subscription_camera = self.create_subscription(
-            CompressedImage,
-            '/camera/image_raw/compressed',
-            self.camera_image_callback,
-            QOS_PROFILE_DEFAULT)
+        # Control & State Flags
+        self.is_driving_enabled = False
+        self.current_mode = "DUAL_CENTERING"
+        self.turn_direction = "LEFT"
 
-        # Publisher for edge vectors.
-        self.publisher_edge_vectors = self.create_publisher(
-            EdgeVectors,
-            '/edge_vectors',
-            QOS_PROFILE_DEFAULT)
+        # Publishers
+        self.publisher_vectors = self.create_publisher(EdgeVectors, '/edge_vectors', QOS_PROFILE_DEFAULT)
+        self.publisher_curves = self.create_publisher(String, '/edge_curves', QOS_PROFILE_DEFAULT)
+        self.publisher_parabola = self.create_publisher(String, '/turning_parabola', QOS_PROFILE_DEFAULT)
+        self.publisher_thresh = self.create_publisher(CompressedImage, '/debug_images/thresh_image', QOS_PROFILE_DEFAULT)
+        self.publisher_debug = self.create_publisher(CompressedImage, '/debug_images/vector_image', QOS_PROFILE_DEFAULT)
+        self.publisher_parabola_debug = self.create_publisher(CompressedImage, '/debug_images/parabola_curve', QOS_PROFILE_DEFAULT)
 
-        # Publisher for thresh image (for debugging thresholding/segmentation).
-        self.publisher_thresh_image = self.create_publisher(
-            CompressedImage,
-            "/debug_images/thresh_image",
-            QOS_PROFILE_DEFAULT)
+        # Subscriptions
+        self.subscription_image = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.image_callback, QOS_PROFILE_DEFAULT)
+        self.subscription_mode = self.create_subscription(String, '/driving_mode', self.mode_callback, QOS_PROFILE_DEFAULT)
+        self.subscription_sign = self.create_subscription(String, '/sign_board_detection', self.sign_callback, QOS_PROFILE_DEFAULT)
+        self.subscription_server = self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_callback, QOS_PROFILE_DEFAULT)
 
-        # Publisher for vector image (for debugging vector drawing).
-        self.publisher_vector_image = self.create_publisher(
-            CompressedImage,
-            "/debug_images/vector_image",
-            QOS_PROFILE_DEFAULT)
+        self.get_logger().info("🏎️ Edge Vector & Parabola Node Active [Awaiting Server Start...]")
 
-        self.image_height = 0
-        self.image_width = 0
-        self.lower_image_height = 0
-        self.upper_image_height = 0
+    def server_callback(self, msg):
+        """Gates all perception until active server command is received."""
+        if msg.dest == BUGGY_ID and msg.msg not in ["", "OK", "INVALID"]:
+            if not self.is_driving_enabled:
+                self.is_driving_enabled = True
+                self.get_logger().info("🟢 SERVER START RECEIVED: Perception & Detection Enabled!")
+        elif msg.dest == BUGGY_ID and msg.msg == "OK":
+            self.is_driving_enabled = False
+            self.get_logger().info("🔴 SERVER STOP RECEIVED: Perception Paused.")
 
-    def publish_debug_image(self, publisher, image):
-        """Helper function to publish OpenCV debug images to ROS topics."""
-        message = CompressedImage()
-        _, encoded_data = cv2.imencode('.jpg', image)
-        message.format = "jpeg"
-        message.data = encoded_data.tobytes()
-        publisher.publish(message)
+    def mode_callback(self, msg):
+        self.current_mode = msg.data.strip().upper()
 
-    def get_vector_angle_in_radians(self, vector):
-        """Calculates the slope angle of a vector in radians."""
-        if ((vector[0][0] - vector[1][0]) == 0):  # Prevent division by zero
-            theta = PI / 2
-        else:
-            slope = (vector[1][1] - vector[0][1]) / (vector[0][0] - vector[1][0])
-            theta = math.atan(slope)
-        return theta
+    def sign_callback(self, msg):
+        # Ignore sign boards if server has not enabled driving
+        if not self.is_driving_enabled:
+            return
+        direction = msg.data.strip().upper()
+        if direction in ["LEFT", "RIGHT"]:
+            self.turn_direction = direction
 
-    def compute_vectors_from_image(self, image, thresh):
-        """
-        Analyzes the binary threshold image and extracts left and right lane edge vectors.
-        """
-        contours = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+    def _publish_compressed(self, publisher, cv_img):
+        try:
+            msg = CompressedImage()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.format = "jpeg"
+            msg.data = np.array(cv2.imencode('.jpg', cv_img)[1]).tobytes()
+            publisher.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f"Image publish error: {e}")
 
-        vectors = []
-        rover_point = [self.image_width / 2.0, self.lower_image_height]
-
-        for i in range(len(contours)):
-            coordinates = contours[i][:, 0, :]
-            if len(coordinates) < 5:
-                continue
-
-            min_y_value = np.min(coordinates[:, 1])
-            max_y_value = np.max(coordinates[:, 1])
-
-            min_y_coords = coordinates[coordinates[:, 1] == min_y_value]
-            max_y_coords = coordinates[coordinates[:, 1] == max_y_value]
-
-            min_y_coord = np.array(min_y_coords[0], dtype=float)
-            max_y_coord = np.array(max_y_coords[0], dtype=float)
-
-            # Calculate contour vector magnitude
-            magnitude = np.linalg.norm(min_y_coord - max_y_coord)
-            if magnitude > VECTOR_MAGNITUDE_MINIMUM:
-                middle_point = (min_y_coord + max_y_coord) / 2.0
-                distance = np.linalg.norm(middle_point - rover_point)
-
-                angle = self.get_vector_angle_in_radians([min_y_coord, max_y_coord])
-                if angle > 0:
-                    min_y_coord[0] = float(np.max(min_y_coords[:, 0]))
-                else:
-                    max_y_coord[0] = float(np.max(max_y_coords[:, 0]))
-
-                vectors.append([list(min_y_coord), list(max_y_coord), distance])
-
-                # Draw raw candidate vectors in blue
-                cv2.line(
-                    image, 
-                    (int(min_y_coord[0]), int(min_y_coord[1])), 
-                    (int(max_y_coord[0]), int(max_y_coord[1])), 
-                    BLUE_COLOR, 2
-                )
-
-        return vectors, image
-
-    def process_image_for_edge_vectors(self, image):
-        """
-        Applies HSV thresholding and extracts left/right lane vectors cleanly.
-        """
-        self.image_height, self.image_width, _ = image.shape
-        self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
-        self.upper_image_height = int(self.image_height - self.lower_image_height)
-
-        # 1. Convert to HSV color space for better resilience against shadow/lighting
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-
-        # 2. Thresholding for dark black lane border stripes
-        lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, 60])
-        thresh = cv2.inRange(hsv, lower_black, upper_black)
-
-        # Clean noise using morphological opening/closing
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-        # 3. Crop ROI to lower portion of the image
-        thresh_cropped = thresh[self.upper_image_height:].copy()
-        image_cropped = image[self.upper_image_height:].copy()
-
-        # 4. Compute vectors from binary contours
-        vectors, debug_img = self.compute_vectors_from_image(image_cropped, thresh_cropped)
-
-        # 5. Sort vectors by proximity to the rover
-        vectors = sorted(vectors, key=lambda x: x[2])
-
-        # 6. Separate left and right vectors
-        half_width = self.image_width / 2.0
-        vectors_left = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) < half_width]
-        vectors_right = [v for v in vectors if ((v[0][0] + v[1][0]) / 2.0) >= half_width]
-
-        final_vectors = []
-        for side_vectors in [vectors_left, vectors_right]:
-            if len(side_vectors) > 0:
-                best_vector = side_vectors[0]
-                
-                # Draw key lane boundary in green
-                p1 = (int(best_vector[0][0]), int(best_vector[0][1]))
-                p2 = (int(best_vector[1][0]), int(best_vector[1][1]))
-                cv2.line(debug_img, p1, p2, GREEN_COLOR, 2)
-
-                # Map y-coordinates back to global frame space
-                v_copy = [
-                    [best_vector[0][0], best_vector[0][1] + self.upper_image_height],
-                    [best_vector[1][0], best_vector[1][1] + self.upper_image_height]
-                ]
-                final_vectors.append(v_copy)
-
-        self.publish_debug_image(self.publisher_thresh_image, thresh_cropped)
-        self.publish_debug_image(self.publisher_vector_image, debug_img)
-
-        return final_vectors
-
-    def camera_image_callback(self, message):
-        """Processes incoming camera frames and publishes detected EdgeVectors."""
-        np_arr = np.frombuffer(message.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        if image is None:
+    def process_turning_parabola(self, cv_image, h_full, w_full):
+        """Extracts parabolic curve equation using LOWER ROI contours during TURNING mode."""
+        if self.current_mode != "TURNING":
+            payload = json.dumps({"lane_detected": False, "reason": "NOT_IN_TURNING_MODE"})
+            self.publisher_parabola.publish(String(data=payload))
             return
 
-        vectors = self.process_image_for_edge_vectors(image)
+        # Terminal Log: Currently Active Topic
+        self.get_logger().info("📡 [ACTIVE TOPIC: /turning_parabola] Processing Parabolic Curve...")
 
-        vectors_message = EdgeVectors()
-        vectors_message.image_height = image.shape[0]
-        vectors_message.image_width = image.shape[1]
-        vectors_message.vector_count = 0
+        try:
+            # 1. Focus strictly on lower ROI to eliminate horizon noise
+            p_top_y = int(h_full * PARABOLA_ROI_TOP)
+            p_bot_y = int(h_full * PARABOLA_ROI_BOT)
+            p_roi = cv_image[p_top_y:p_bot_y, :].copy()
+            roi_h, roi_w = p_roi.shape[:2]
 
-        # Vector 1 (Left Boundary)
-        if len(vectors) > 0:
-            vectors_message.vector_1[0].x = float(vectors[0][0][0])
-            vectors_message.vector_1[0].y = float(vectors[0][0][1])
-            vectors_message.vector_1[1].x = float(vectors[0][1][0])
-            vectors_message.vector_1[1].y = float(vectors[0][1][1])
-            vectors_message.vector_count += 1
+            # 2. Thresholding for Black Lane Line
+            hsv = cv2.cvtColor(p_roi, cv2.COLOR_BGR2HSV)
+            mask_hsv = cv2.inRange(hsv, LANE_BLACK_HSV_LOWER, LANE_BLACK_HSV_UPPER)
+            lab = cv2.cvtColor(p_roi, cv2.COLOR_BGR2LAB)
+            _, mask_lab = cv2.threshold(lab[:, :, 0], LAB_L_MAX_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+            thresh = cv2.bitwise_and(mask_hsv, mask_lab)
 
-        # Vector 2 (Right Boundary)
-        if len(vectors) > 1:
-            vectors_message.vector_2[0].x = float(vectors[1][0][0])
-            vectors_message.vector_2[0].y = float(vectors[1][0][1])
-            vectors_message.vector_2[1].x = float(vectors[1][1][0])
-            vectors_message.vector_2[1].y = float(vectors[1][1][1])
-            vectors_message.vector_count += 1
+            k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k3)
 
-        self.publisher_edge_vectors.publish(vectors_message)
+            # 3. Partition Mask based on turn direction (Left 60% vs Right 60%)
+            dir_mask = np.zeros_like(thresh)
+            if self.turn_direction == "LEFT":
+                dir_mask[:, 0:int(roi_w * 0.65)] = 255
+            else:
+                dir_mask[:, int(roi_w * 0.35):roi_w] = 255
+
+            active_thresh = cv2.bitwise_and(thresh, dir_mask)
+
+            # 4. Find Lane Contours
+            cnts, _ = cv2.findContours(active_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_cnts = [c for c in cnts if cv2.contourArea(c) >= MIN_CONTOUR_AREA and contour_vertical_span(c) >= MIN_CONTOUR_HEIGHT]
+
+            if not valid_cnts:
+                self.get_logger().warn("⚠️ [/turning_parabola] No valid curve contours found in lower ROI.")
+                payload = json.dumps({"lane_detected": False, "reason": "NO_VALID_CONTOURS"})
+                self.publisher_parabola.publish(String(data=payload))
+                return
+
+            # Pick largest contour on turning side
+            best_contour = max(valid_cnts, key=cv2.contourArea)
+
+            # Extract clean strip centroids along the contour
+            centroids = contour_centroids_by_strip(best_contour, SLIDING_STRIPS)
+
+            if len(centroids) < MIN_POLY_POINTS:
+                self.get_logger().warn("⚠️ [/turning_parabola] Insufficient contour strip points for polyfit.")
+                payload = json.dumps({"lane_detected": False, "reason": "INSUFFICIENT_POINTS"})
+                self.publisher_parabola.publish(String(data=payload))
+                return
+
+            # Convert to absolute full image coordinates (y, x)
+            ys = np.array([pt[1] + p_top_y for pt in centroids])
+            xs = np.array([pt[0] for pt in centroids])
+
+            # Fit x = A*y^2 + B*y + C
+            poly_coeffs = np.polyfit(ys, xs, 2)
+            A, B, C = float(poly_coeffs[0]), float(poly_coeffs[1]), float(poly_coeffs[2])
+
+            eval_y = min(max(LOOKAHEAD_Y_PIXEL, p_top_y), p_bot_y)
+            target_x_lane = (A * (eval_y ** 2)) + (B * eval_y) + C
+
+            payload = json.dumps({
+                "lane_detected": True,
+                "A": A,
+                "B": B,
+                "C": C,
+                "target_x_lane": float(target_x_lane),
+                "eval_y": int(eval_y),
+                "direction": self.turn_direction
+            })
+            self.publisher_parabola.publish(String(data=payload))
+            self.get_logger().info(f"✅ [/turning_parabola] Parabola FIT OK! A={A:.6f} | Target X={target_x_lane:.1f}")
+
+            # 5. Draw Fitted Parabola Curve on Overlay
+            parabola_debug_img = cv_image.copy()
+            y_pts = np.linspace(p_top_y, p_bot_y, 40)
+            x_pts = (A * (y_pts ** 2)) + (B * y_pts) + C
+
+            curve_points = []
+            for x_val, y_val in zip(x_pts, y_pts):
+                if 0 <= x_val < w_full:
+                    curve_points.append([int(x_val), int(y_val)])
+
+            if len(curve_points) > 1:
+                cv2.polylines(parabola_debug_img, [np.array(curve_points, dtype=np.int32)], isClosed=False, color=(0, 255, 255), thickness=4)
+
+            # Draw evaluated point and text
+            cv2.circle(parabola_debug_img, (int(target_x_lane), eval_y), 8, (0, 0, 255), -1)
+            cv2.putText(parabola_debug_img, f"TOPIC: /turning_parabola | A: {A:.6f}", (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+            self._publish_compressed(self.publisher_parabola_debug, parabola_debug_img)
+
+        except Exception as e:
+            self.get_logger().error(f"Error in parabola processing: {e}")
+
+    def image_callback(self, message):
+        # Server Gating Check
+        if not self.is_driving_enabled:
+            return
+
+        try:
+            np_arr = np.frombuffer(message.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if cv_image is None:
+                return
+
+            h_full, w_full = cv_image.shape[:2]
+
+            # ── 1. TURNING MODE: Process Parabola Curve ──────────────────────
+            if self.current_mode == "TURNING":
+                self.process_turning_parabola(cv_image, h_full, w_full)
+
+            # ── 2. DUAL CENTERING MODE: Process Straight Edge Vectors ─────────
+            else:
+                self.get_logger().info("📡 [ACTIVE TOPIC: /edge_vectors] Processing Straight Dual Lanes...")
+
+                x_lo, x_hi = BORDER_STRIP_PX, w_full - BORDER_STRIP_PX
+                roi_top_y = int(h_full * ROI_TOP_FRAC)
+                roi_bot_y = int(h_full * ROI_BOTTOM_FRAC)
+
+                roi = cv_image[roi_top_y:roi_bot_y, x_lo:x_hi].copy()
+                roi_h, roi_w = roi.shape[:2]
+                mid_x = roi_w / 2.0
+                roi_mid_y = int(roi_h / 2.0)
+
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                mask_hsv = cv2.inRange(hsv, LANE_BLACK_HSV_LOWER, LANE_BLACK_HSV_UPPER)
+                lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+                _, mask_lab = cv2.threshold(lab[:, :, 0], LAB_L_MAX_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+
+                thresh = cv2.bitwise_and(mask_hsv, mask_lab)
+                k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k3)
+
+                bottom_thresh = thresh[roi_mid_y:roi_h, :]
+                top_thresh = thresh[0:roi_mid_y, :]
+
+                cnts_bot, _ = cv2.findContours(bottom_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cnts_top, _ = cv2.findContours(top_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                curve_data = {'left': {}, 'right': {}}
+                vectors = []
+
+                for side in ['left', 'right']:
+                    bot_partition = [c for c in cnts_bot if (get_centroid_x(c) < mid_x if side == 'left' else get_centroid_x(c) >= mid_x)]
+                    top_partition = [c for c in cnts_top if (get_centroid_x(c) < mid_x if side == 'left' else get_centroid_x(c) >= mid_x)]
+
+                    bot_centroids = []
+                    if bot_partition:
+                        c_bot_best = max(bot_partition, key=contour_vertical_span)
+                        bot_centroids = [(p[0], p[1] + roi_mid_y) for p in contour_centroids_by_strip(c_bot_best, 6)]
+
+                    top_centroids = []
+                    if top_partition:
+                        c_top_best = max(top_partition, key=contour_vertical_span)
+                        top_centroids = contour_centroids_by_strip(c_top_best, 6)
+
+                    top_point_count = len(top_centroids)
+                    total_centroids = top_centroids + bot_centroids
+
+                    if len(total_centroids) >= MIN_POLY_POINTS:
+                        ys = np.array([p[1] for p in total_centroids])
+                        xs = np.array([p[0] for p in total_centroids])
+
+                        coeffs = np.polyfit(ys, xs, 2)
+                        sample_ys = np.linspace(0, roi_h - 1, POLY_SAMPLE_POINTS)
+                        sample_xs = np.polyval(coeffs, sample_ys)
+
+                        is_valid = all(x < mid_x if side == 'left' else x >= mid_x for x in sample_xs)
+
+                        if is_valid:
+                            vec_bot = (sample_xs[-1], sample_ys[-1] + roi_top_y)
+                            vec_top = (sample_xs[0], sample_ys[0] + roi_top_y)
+                            vectors.append((side, vec_bot, vec_top))
+
+                            curve_data[side] = {
+                                'A': float(coeffs[0]),
+                                'B': float(coeffs[1]),
+                                'C': float(coeffs[2]),
+                                'top_points': top_point_count,
+                                'bot_points': len(bot_centroids)
+                            }
+
+                vm = EdgeVectors()
+                vm.image_height, vm.image_width = h_full, w_full
+                vm.vector_count = len(vectors)
+
+                for i, vec in enumerate(vectors):
+                    target_vec = vm.vector_1 if i == 0 else vm.vector_2
+                    target_vec[0].x, target_vec[0].y = map(float, vec[1])
+                    target_vec[1].x, target_vec[1].y = map(float, vec[2])
+
+                self.publisher_vectors.publish(vm)
+
+                cm = String()
+                cm.data = json.dumps(curve_data)
+                self.publisher_curves.publish(cm)
+
+                # Debug Overlay
+                debug_img = roi.copy()
+                cv2.line(debug_img, (0, roi_mid_y), (roi_w, roi_mid_y), (0, 255, 255), 1)
+                cv2.line(debug_img, (int(mid_x), 0), (int(mid_x), roi_h), (255, 255, 255), 1)
+                cv2.putText(debug_img, "TOPIC: /edge_vectors", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                debug_full = cv_image.copy()
+                debug_full[roi_top_y:roi_bot_y, x_lo:x_hi] = debug_img
+                self._publish_compressed(self.publisher_thresh, thresh)
+                self._publish_compressed(self.publisher_debug, debug_full)
+
+        except Exception as e:
+            self.get_logger().error(f"Image processing error: {e}")
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = EdgeVectorsPublisher()
+    node = EdgeVectorsNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -254,6 +360,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

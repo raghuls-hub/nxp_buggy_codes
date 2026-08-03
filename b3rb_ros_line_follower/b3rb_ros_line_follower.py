@@ -1,252 +1,306 @@
 # Copyright 2024-2026 NXP
-# Copyright 2016 Open Source Robotics Foundation, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Dual-Mode Line Follower with Alongside-Lane Cyclic Distance Turning Mechanism
 
 import rclpy
 from rclpy.node import Node
 import math
-from sensor_msgs.msg import Joy
+import json
+import cv2
+import numpy as np
+import sys
+from enum import Enum
+
+from sensor_msgs.msg import Joy, CompressedImage
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
 
 QOS_PROFILE_DEFAULT = 10
 
-# Driving & Centering Constants
-CRUISE_SPEED = 0.4
-MIN_SPEED = 0.12
-MAX_STEER = 0.8
-KP_STEER = 0.0035
-SINGLE_LANE_OFFSET = 120
+# Speeds
+CRUISE_SPEED            = 0.38   # Fast straight cruise speed
+TURN_CRAWL_SPEED        = 0.20   # Crawl speed while turning to reduce delta distance
+TURN_CURVE_TRACK_SPEED  = 0.30   # Speed when moving forward alongside lane
 
-BUGGY_ID = 1
-SERVER_ID = 2
+# Control & Steering Constants
+KP_STEER_DIST           = 0.0075
+AUTO_STEER_MAGNITUDE    = 0.55   # Turning steer command magnitude (+ = Left, - = Right)
+DELTA_TOLERANCE_PX      = 15.0   # Hysteresis band (pixels) for d_cached distance
+SINGLE_LANE_OFFSET      = 120.0  # Fallback offset if d_cached is uninitialized
 
-# Turn Execution & Bias Constants
-TARGET_TURN_ANGLE = math.radians(85.0)  # 85 degrees relative yaw target
-TURN_BIAS = 0.35                        # Directional steering offset during turns
+TARGET_TURN_ANGLE       = math.radians(85.0)  # Stop turning cycle at 85° (80° - 90°)
+
+BUGGY_ID                = 1
+SERVER_ID               = 2
+
+
+class DrivingMode(Enum):
+    DUAL_CENTERING = 1
+    TURNING = 2
+
 
 class LineFollower(Node):
     """
-    Core Controller Node for B3RB Buggy:
-    - Vector-Aware Junction Navigation & Closed-Loop Lane Centering Controller.
-    - Blends dynamic edge vector tracking with relative yaw progress to eliminate boundary breaches.
-    - Manages destination stops, QR disappearance, and server handshakes.
+    ROS 2 Dual-Mode Line Follower Node with Alongside-Lane Cyclic Distance Turning Mechanism.
     """
     def __init__(self):
         super().__init__('line_follower')
 
-        # Motion Output
-        self.target_speed = 0.0
-        self.target_turn = 0.0
+        self.current_mode = DrivingMode.DUAL_CENTERING
         self.is_driving_enabled = False
 
-        # Orientation & Junction Turn State
-        self.current_yaw = 0.0
-        self.is_turning = False
-        self.turn_direction = None          # "LEFT" or "RIGHT"
-        self.initial_yaw = 0.0              # Heading theta_0 at turn entry
+        self.target_speed = 0.0
+        self.target_turn = 0.0
 
-        # QR Tracking State
-        self.detected_qr_buffer = ""
-        self.has_scanned_active_qr = False
+        # Yaw and Cached Distance Memory
+        self.current_yaw = 0.0
+        self.initial_yaw = 0.0
+        self.turn_direction = None
+        self.d_cached = SINGLE_LANE_OFFSET
+
+        # Parabola Curve Data from Edge Vectors Node
+        self.parabola_detected = False
+        self.parabola_A = 0.0
+        self.parabola_x_lane = 0.0
+
+        self.latest_camera_frame = None
 
         # Server Communication State
+        self.detected_qr_buffer = ""
+        self.has_scanned_active_qr = False
         self.msg_uid = 10
         self.current_target = None
         self.awaiting_ack_for_uid = None
 
-        # ------------------ Publishers ------------------
-        self.publisher_joy = self.create_publisher(
-            Joy,
-            '/cerebri/in/joy',
-            QOS_PROFILE_DEFAULT)
+        # Publishers
+        self.publisher_joy = self.create_publisher(Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT)
+        self.publisher_server = self.create_publisher(ServerCommunication, '/ServerCommunication', QOS_PROFILE_DEFAULT)
+        self.publisher_vector_debug = self.create_publisher(CompressedImage, '/debug_images/vector_images', QOS_PROFILE_DEFAULT)
+        self.publisher_mode = self.create_publisher(String, '/driving_mode', QOS_PROFILE_DEFAULT)
 
-        self.publisher_server = self.create_publisher(
-            ServerCommunication,
-            '/ServerCommunication',
-            QOS_PROFILE_DEFAULT)
-
-        # ------------------ Subscriptions ------------------
-        self.subscription_odom = self.create_subscription(
-            Odometry,
-            '/cerebri/out/odometry',
-            self.odometry_callback,
-            QOS_PROFILE_DEFAULT)
-
-        self.subscription_vectors = self.create_subscription(
-            EdgeVectors,
-            '/edge_vectors',
-            self.edge_vectors_callback,
-            QOS_PROFILE_DEFAULT)
-
-        self.subscription_server = self.create_subscription(
-            ServerCommunication,
-            '/ServerCommunication',
-            self.server_communication_callback,
-            QOS_PROFILE_DEFAULT)
-
-        self.subscription_qr = self.create_subscription(
-            String,
-            '/qr_detection',
-            self.qr_detection_callback,
-            QOS_PROFILE_DEFAULT)
-
-        self.subscription_signs = self.create_subscription(
-            String,
-            '/sign_board_detection',
-            self.sign_board_callback,
-            QOS_PROFILE_DEFAULT)
+        # Subscriptions
+        self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.camera_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(Odometry, '/cerebri/out/odometry', self.odometry_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(EdgeVectors, '/edge_vectors', self.edge_vectors_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(String, '/turning_parabola', self.turning_parabola_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_communication_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(String, '/qr_detection', self.qr_detection_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(String, '/sign_board_detection', self.sign_board_callback, QOS_PROFILE_DEFAULT)
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
-        self.get_logger().info("🏎️ Line Follower with Vector-Guided Centering & Turn Controller Initialized.")
+        self.get_logger().info("🏎️ Cyclic Alongside-Lane Line Follower Active.")
 
-    # ------------------ STAGE A: Heading & Orientation Helper Methods ------------------
+    def publish_mode_status(self):
+        msg = String()
+        msg.data = self.current_mode.name
+        self.publisher_mode.publish(msg)
 
     def normalize_angle(self, angle):
-        """Wraps angle strictly to [-pi, pi]."""
         while angle > math.pi:
             angle -= 2.0 * math.pi
         while angle < -math.pi:
             angle += 2.0 * math.pi
         return angle
 
+    def camera_callback(self, msg):
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                self.latest_camera_frame = frame
+        except Exception as e:
+            self.get_logger().error(f"Error decoding image: {e}")
+
     def odometry_callback(self, msg):
-        """Extracts current Euler yaw angle from Odometry quaternion."""
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
-    # ------------------ Command Publisher & Safety Enforcement ------------------
+    def turning_parabola_callback(self, msg):
+        """Receives live parabola curve data from /turning_parabola topic."""
+        try:
+            data = json.loads(msg.data)
+            self.parabola_detected = data.get("lane_detected", False)
+            if self.parabola_detected:
+                self.parabola_A = data.get("A", 0.0)
+                self.parabola_x_lane = data.get("target_x_lane", 0.0)
+        except Exception as e:
+            self.get_logger().error(f"Error parsing parabola topic: {e}")
 
     def publish_drive_commands(self):
-        """Publishes control commands with steering strictly clamped within [-1.0, 1.0]."""
+        self.publish_mode_status()
         msg = Joy()
-        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  # Software override flag
-        clamped_turn = max(-1.0, min(1.0, float(self.target_turn)))
-        clamped_speed = float(self.target_speed)
-        msg.axes = [0.0, clamped_speed, 0.0, clamped_turn]
+        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
+        clamped_steer = float(max(-1.0, min(1.0, self.target_turn)))
+        msg.axes = [0.0, float(self.target_speed), 0.0, clamped_steer]
         self.publisher_joy.publish(msg)
 
-    # ------------------ STAGE B: Dynamic Vector-Guided Junction Navigation ------------------
-
     def sign_board_callback(self, message):
-        """Initializes vector-guided turn controller upon receiving command."""
-        if not self.is_driving_enabled or self.is_turning:
+        # Gated until server start signal is received
+        if not self.is_driving_enabled:
             return
 
-        direction = message.data
+        direction = message.data.strip().upper()
         if direction in ["LEFT", "RIGHT"]:
-            self.is_turning = True
             self.turn_direction = direction
+            self.current_mode = DrivingMode.TURNING
             self.initial_yaw = self.current_yaw
-            self.get_logger().info(f"🔄 Vector-Guided Turn Triggered: {direction} (Entry Yaw: {math.degrees(self.initial_yaw):.1f}°)")
+            self.publish_mode_status()
+
+            banner = (
+                "\n" + "░" * 65 + "\n"
+                f"  🚀 RESULTANT DIRECTION RECEIVED: [{direction}]\n"
+                f"  🔄 MODE TOGGLED: [DUAL_CENTERING] -> [TURNING]\n"
+                f"  📏 Cached Lane Offset (d_cached): {self.d_cached:.1f} px\n"
+                f"  📐 Initial Yaw Recorded: {math.degrees(self.initial_yaw):.2f}°\n"
+                + "░" * 65 + "\n"
+            )
+            print(banner, flush=True)
+            sys.stdout.flush()
 
     def edge_vectors_callback(self, message):
-        """Processes continuous edge vectors for line-centering and vector-guided turn execution."""
-        if not self.is_driving_enabled:
-            self.target_speed = 0.0
-            self.target_turn = 0.0
-            return
-
-        img_width = message.image_width
-        if img_width == 0:
-            return
-
-        rover_center_x = img_width / 2.0
-        target_center_x = rover_center_x
+        img_w = message.image_width if message.image_width > 0 else 640
+        img_h = message.image_height if message.image_height > 0 else 480
+        rover_center_x = img_w / 2.0
         vector_count = message.vector_count
 
-        # 1. Evaluate Path Centroid based on visible edge vectors
-        if vector_count == 2:
-            left_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            right_x = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
-            target_center_x = (left_x + right_x) / 2.0
-        elif vector_count == 1:
-            detected_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
-            if self.is_turning:
-                # Mid-turn single vector bias: keep distance relative to inner curve boundary
-                if self.turn_direction == "LEFT":
-                    target_center_x = detected_x + SINGLE_LANE_OFFSET
-                else:
-                    target_center_x = detected_x - SINGLE_LANE_OFFSET
+        # Extract Left/Right Vectors
+        vec_left, vec_right = None, None
+        if vector_count >= 1:
+            v1_mid = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            if vector_count >= 2:
+                v2_mid = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+                vec_left = message.vector_1 if v1_mid < v2_mid else message.vector_2
+                vec_right = message.vector_2 if v1_mid < v2_mid else message.vector_1
             else:
-                target_center_x = detected_x + SINGLE_LANE_OFFSET if detected_x < rover_center_x else detected_x - SINGLE_LANE_OFFSET
+                if v1_mid < rover_center_x:
+                    vec_left = message.vector_1
+                else:
+                    vec_right = message.vector_1
 
-        # Proportional centering error
-        error_x = target_center_x - rover_center_x
-        base_centering_turn = -KP_STEER * error_x
+        mode_str = ""
 
-        # 2. Check Junction Turn Completion Criteria
-        if self.is_turning:
-            turn_progress = abs(self.normalize_angle(self.current_yaw - self.initial_yaw))
-            steer_sign = 1.0 if self.turn_direction == "LEFT" else -1.0
+        if self.is_driving_enabled:
 
-            # Exit Condition: Reached target yaw (85 degrees) OR locked onto two straight vectors ahead late in turn
-            if turn_progress >= TARGET_TURN_ANGLE or (turn_progress > math.radians(45.0) and vector_count == 2):
-                self.get_logger().info(f"✅ Turn Complete at {math.degrees(turn_progress):.1f}°. Returning to standard line tracking.")
-                self.is_turning = False
-                self.target_turn = max(-MAX_STEER, min(MAX_STEER, base_centering_turn))
+            # ── MODE 1: DUAL CENTERING ────────────────────────────────────────
+            if self.current_mode == DrivingMode.DUAL_CENTERING:
+                mode_str = "MODE: DUAL_CENTERING"
+
+                if vec_left and vec_right:
+                    x_l = vec_left[0].x
+                    x_r = vec_right[0].x
+                    self.d_cached = (x_r - x_l) / 2.0  # Continuously update cached lane offset
+                    target_center_x = (x_l + x_r) / 2.0
+                elif vec_left:
+                    target_center_x = vec_left[0].x + self.d_cached
+                elif vec_right:
+                    target_center_x = vec_right[0].x - self.d_cached
+                else:
+                    target_center_x = rover_center_x
+
+                dist_error = target_center_x - rover_center_x
+                self.target_turn = -KP_STEER_DIST * dist_error
                 self.target_speed = CRUISE_SPEED
-                return
 
-            # Blend turn bias into line-centering controller during turn
-            blended_turn = base_centering_turn + (steer_sign * TURN_BIAS)
-            self.target_turn = max(-MAX_STEER, min(MAX_STEER, blended_turn))
-            self.target_speed = MIN_SPEED
-            return
+            # ── MODE 2: TURNING WITH ALONGSIDE-LANE CYCLIC MECHANISM ───────────
+            elif self.current_mode == DrivingMode.TURNING:
+                angle_turned = abs(self.normalize_angle(self.current_yaw - self.initial_yaw))
 
-        # 3. Standard Straight Proportional Line Following
-        self.target_turn = max(-MAX_STEER, min(MAX_STEER, base_centering_turn))
-        turn_severity = abs(self.target_turn) / MAX_STEER
-        self.target_speed = max(MIN_SPEED, CRUISE_SPEED * (1.0 - 0.5 * turn_severity))
+                # Step 1: Calculate Delta Distance between Buggy Center and Parabola Lane End
+                if not self.parabola_detected:
+                    delta_d = float('inf')  # Set delta to INFINITY if no parabola exists
+                else:
+                    delta_d = abs(self.parabola_x_lane - rover_center_x)
 
-    # ------------------ Destination Handshake & Server Protocol ------------------
+                d_target = self.d_cached
+                delta_threshold = d_target + DELTA_TOLERANCE_PX
 
+                # Step 2: Cyclic Turning & Forward Logic
+                if delta_d == float('inf'):
+                    # State A: No Parabola -> Turn vehicle towards left/right direction
+                    self.target_speed = TURN_CRAWL_SPEED
+                    self.target_turn = +AUTO_STEER_MAGNITUDE if self.turn_direction == "LEFT" else -AUTO_STEER_MAGNITUDE
+                    mode_str = f"TURNING [{self.turn_direction}] Delta=INF -> Searching Parabola..."
+                    self.get_logger().info(f"🔄 Parabola Missing (delta=INF) -> Turning towards {self.turn_direction}. Angle: {math.degrees(angle_turned):.1f}°")
+
+                elif delta_d > delta_threshold:
+                    # State B: Distance increased above d_cached -> Turn to reduce delta back to d_cached
+                    self.target_speed = TURN_CRAWL_SPEED
+                    self.target_turn = +AUTO_STEER_MAGNITUDE if self.turn_direction == "LEFT" else -AUTO_STEER_MAGNITUDE
+                    mode_str = f"TURNING [{self.turn_direction}] Delta ({delta_d:.1f}px) > Target -> Turning to reduce delta..."
+                    self.get_logger().info(f"📐 Delta ({delta_d:.1f}px) > Target ({d_target:.1f}px) -> Turning to reduce distance. Angle: {math.degrees(angle_turned):.1f}°")
+
+                else:
+                    # State C: Reached d_cached distance -> Stop turning hard & Move Forward Alongside Lane!
+                    self.target_speed = TURN_CURVE_TRACK_SPEED
+
+                    # Smooth forward tracking along target offset
+                    desired_x = self.parabola_x_lane + (self.d_cached if self.turn_direction == "LEFT" else -self.d_cached)
+                    dist_error = desired_x - rover_center_x
+                    self.target_turn = -KP_STEER_DIST * dist_error
+
+                    mode_str = f"ALONGSIDE LANE [{self.turn_direction}] Delta ({delta_d:.1f}px) <= Target -> Moving Forward!"
+                    self.get_logger().info(f"🚀 ALONGSIDE LANE: Delta ({delta_d:.1f}px) <= Target ({d_target:.1f}px) -> Moving Forward! Angle: {math.degrees(angle_turned):.1f}°")
+
+                # Step 3: Termination Check (80° to 90° Turn Reached)
+                if angle_turned >= TARGET_TURN_ANGLE:
+                    self.get_logger().info(
+                        f"✅ TURN COMPLETE! Turned: {math.degrees(angle_turned):.1f}°. Re-engaging [DUAL_CENTERING].")
+
+                    self.current_mode = DrivingMode.DUAL_CENTERING
+                    self.turn_direction = None
+                    self.parabola_detected = False
+                    self.publish_mode_status()
+
+        else:
+            self.target_speed, self.target_turn = 0.0, 0.0
+            mode_str = "STANDBY"
+
+        self.render_debug_vectors(img_w, img_h, rover_center_x, vec_left, vec_right, mode_str)
+
+    def render_debug_vectors(self, img_w, img_h, rover_center_x, vec_l, vec_r, mode_str):
+        if self.latest_camera_frame is not None:
+            canvas = cv2.resize(self.latest_camera_frame.copy(), (img_w, img_h))
+        else:
+            canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+        cv2.line(canvas, (int(rover_center_x), 0), (int(rover_center_x), img_h), (128, 128, 128), 1)
+
+        status_color = (0, 165, 255) if self.current_mode == DrivingMode.TURNING else (0, 255, 0)
+        cv2.putText(canvas, mode_str, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 2)
+
+        try:
+            msg = CompressedImage()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.format = "jpeg"
+            msg.data = np.array(cv2.imencode('.jpg', canvas)[1]).tobytes()
+            self.publisher_vector_debug.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish debug vector image: {e}")
+
+    # Server Communication Handlers
     def qr_detection_callback(self, message):
         if not self.is_driving_enabled and not self.has_scanned_active_qr:
             return
-
         qr_text = message.data
-
         if qr_text != "":
             self.detected_qr_buffer = qr_text
             self.has_scanned_active_qr = True
         elif qr_text == "" and self.has_scanned_active_qr:
-            final_scanned_payload = self.detected_qr_buffer
-            self.get_logger().info(f"🛑 Target reached! QR code disappeared: '{final_scanned_payload}'")
-
+            final_scanned = self.detected_qr_buffer
+            self.get_logger().info(f"🛑 Destination reached! Scanned: '{final_scanned}'")
             self.is_driving_enabled = False
-            self.target_speed = 0.0
-            self.target_turn = 0.0
-
+            self.target_speed, self.target_turn = 0.0, 0.0
             self.has_scanned_active_qr = False
-            self.detected_qr_buffer = ""
-
-            self.send_server_message(text_payload=final_scanned_payload, ack_flag=0)
+            self.send_server_message(text_payload=final_scanned, ack_flag=0)
 
     def send_server_message(self, text_payload, ack_flag=0, custom_uid=None):
         packet = ServerCommunication()
-        packet.src = BUGGY_ID
-        packet.dest = SERVER_ID
+        packet.src, packet.dest = BUGGY_ID, SERVER_ID
         packet.uid = custom_uid if custom_uid is not None else self.msg_uid
-        packet.ack = ack_flag
-        packet.msg = text_payload
-
+        packet.ack, packet.msg = ack_flag, text_payload
         self.publisher_server.publish(packet)
-
         if ack_flag == 0:
             self.awaiting_ack_for_uid = packet.uid
             self.msg_uid = (self.msg_uid + 1) % 256
@@ -254,27 +308,19 @@ class LineFollower(Node):
     def server_communication_callback(self, message):
         if message.dest != BUGGY_ID:
             return
-
         if message.ack == 1:
             if message.uid == self.awaiting_ack_for_uid:
                 self.awaiting_ack_for_uid = None
             return
-
         if message.msg != "":
-            incoming_text = message.msg
             self.send_server_message(text_payload="", ack_flag=1, custom_uid=message.uid)
-
-            if incoming_text == "OK":
+            if message.msg == "OK":
                 self.is_driving_enabled = False
-                self.target_speed = 0.0
-                self.target_turn = 0.0
-                self.get_logger().info("🎉 Mission Complete!")
-            elif incoming_text == "INVALID":
-                self.get_logger().warn("⚠️ Server returned INVALID.")
-            else:
-                self.current_target = incoming_text
+                self.target_speed, self.target_turn = 0.0, 0.0
+            elif message.msg != "INVALID":
+                self.current_target = message.msg
                 self.is_driving_enabled = True
-                self.get_logger().info(f"🚀 Driving enabled for target: '{self.current_target}'")
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -284,13 +330,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        stop_msg = Joy()
-        stop_msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
-        stop_msg.axes = [0.0, 0.0, 0.0, 0.0]
-        node.publisher_joy.publish(stop_msg)
-
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
