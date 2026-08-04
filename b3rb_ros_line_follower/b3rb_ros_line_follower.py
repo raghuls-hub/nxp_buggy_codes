@@ -1,6 +1,5 @@
 # Copyright 2024-2026 NXP
-# Simplified Unified Parabola & Vector Line Follower Node
-# Features: Continuous Parabola Distance Maintenance & Vector Centering (No Modes/State Machines)
+# Parabola & Vector Line Follower with Sequential State Machine & Junction Turn Fallback
 
 import rclpy
 from rclpy.node import Node
@@ -14,36 +13,49 @@ from synapse_msgs.msg import EdgeVectors, ServerCommunication
 
 QOS_PROFILE_DEFAULT = 10
 
-# ── Speed & Steering Constants ────────────────────────────────────────────────
-CRUISE_FORWARD_SPEED    = 0.35   # Cruising speed
-STEER_STRAIGHT          = 0.0    # Neutral forward steering
+# ── Driving & Control Constants ───────────────────────────────────────────────
+CRUISE_FORWARD_SPEED       = 0.35   # Normal driving speed
+JUNCTION_TURN_SPEED        = 0.25   # Speed during blind junction recovery turn
+JUNCTION_STEER_MAGNITUDE   = 0.50   # Open-loop turn steering magnitude
 
-KP_STEER_DIST           = 0.0075 # Steering proportional gain for centering/parabola offset
-SINGLE_LANE_OFFSET      = 120.0  # Default cached half-lane width (pixels)
-DELTA_TOLERANCE         = 15.0   # Boundary tolerance for parabola distance control
+KP_STEER_DIST              = 0.0075 # Steering P gain for centering/parabola offset
+SINGLE_LANE_OFFSET         = 120.0  # Default half-lane width (pixels)
+DELTA_TOLERANCE            = 15.0   # Boundary tolerance for parabola distance control
 
-BUGGY_ID                = 1
-SERVER_ID               = 2
+MAX_LOST_FRAMES_THRESHOLD  = 5      # Consecutive frames without lane lines before blind turn recovery
+
+BUGGY_ID                   = 1
+SERVER_ID                  = 2
+
+# Mission States
+STATE_IDLE                 = "IDLE"
+STATE_EN_ROUTE_PATIENT     = "EN_ROUTE_PATIENT"
+STATE_EN_ROUTE_HOSPITAL    = "EN_ROUTE_HOSPITAL"
 
 
 class LineFollower(Node):
     """
-    ROS 2 Line Follower Node with unified continuous driving logic:
-    1. Uses parabola delta distance control when parabola is detected.
-    2. Uses vector centering when parabola is not present.
+    ROS 2 Line Follower Node featuring:
+    1. Sequential Mission State Machine (Server -> Patient -> Hospital).
+    2. Junction blind-turn recovery using result direction when lane lines disappear.
     """
     def __init__(self):
         super().__init__('line_follower')
 
-        # Driving Control State
+        # Mission State Machine
+        self.mission_state = STATE_IDLE
         self.is_driving_enabled = False
+
+        # Motion Output State
         self.target_speed = 0.0
         self.target_turn = 0.0
 
+        # Perception & Navigation State
         self.turn_direction = "LEFT"  # "LEFT" or "RIGHT"
         self.d_cached = SINGLE_LANE_OFFSET
         self.delta_d = float('inf')
         self.parabola_detected = False
+        self.no_lane_frames = 0        # Counter for missing lane frames
 
         self.latest_camera_frame = None
 
@@ -65,9 +77,16 @@ class LineFollower(Node):
         self.create_subscription(String, '/turning_parabola', self.turning_parabola_callback, QOS_PROFILE_DEFAULT)
         self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_communication_callback, QOS_PROFILE_DEFAULT)
         self.create_subscription(String, '/qr_detection', self.qr_detection_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(String, '/sign_board_detection', self.sign_callback, QOS_PROFILE_DEFAULT)
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
-        self.get_logger().info("🏎️ Simplified Parabola & Vector Line Follower Initialized")
+        self.get_logger().info("🏎️ State Machine Line Follower Node Initialized.")
+
+    def sign_callback(self, msg):
+        direction = msg.data.strip().upper()
+        if direction in ["LEFT", "RIGHT", "STRAIGHT"]:
+            self.turn_direction = direction
+            self.get_logger().info(f"🧭 Result Direction Updated: [{self.turn_direction}]")
 
     def camera_callback(self, msg):
         try:
@@ -84,36 +103,29 @@ class LineFollower(Node):
             self.parabola_detected = data.get("lane_detected", False)
             if self.parabola_detected:
                 self.delta_d = abs(data.get("delta_d", float('inf')))
-                self.turn_direction = str(data.get("direction", "LEFT")).strip().upper()
+                if "direction" in data:
+                    self.turn_direction = str(data.get("direction")).strip().upper()
             else:
                 self.delta_d = float('inf')
         except Exception as e:
             self.get_logger().error(f"Error parsing parabola payload: {e}")
 
     def apply_parabola_distance_control(self, resultant_dir):
-        """
-        Maintains target offset distance (d_cached) from detected parabola curve.
-        """
         upper_bound = self.d_cached + DELTA_TOLERANCE
         lower_bound = max(0.0, self.d_cached - DELTA_TOLERANCE)
 
         self.target_speed = CRUISE_FORWARD_SPEED
 
-        # Too far from parabola -> Steer inward toward curve
         if self.delta_d > upper_bound:
             dist_error = self.delta_d - upper_bound
             self.target_turn = resultant_dir * min(0.45, KP_STEER_DIST * dist_error)
             return f"PARABOLA: Delta {self.delta_d:.1f} > {upper_bound:.1f} -> Steer Inward"
-
-        # Too close to parabola -> Steer outward away from curve
         elif self.delta_d < lower_bound:
             dist_error = lower_bound - self.delta_d
             self.target_turn = -resultant_dir * min(0.45, KP_STEER_DIST * dist_error)
             return f"PARABOLA: Delta {self.delta_d:.1f} < {lower_bound:.1f} -> Steer Outward"
-
-        # Distance matched -> Drive straight
         else:
-            self.target_turn = STEER_STRAIGHT
+            self.target_turn = 0.0
             return f"PARABOLA: Matched ({self.delta_d:.1f} ~= {self.d_cached:.1f}) -> Straight"
 
     def edge_vectors_callback(self, message):
@@ -138,14 +150,16 @@ class LineFollower(Node):
         status_str = ""
 
         if self.is_driving_enabled:
-            resultant_dir = 1.0 if self.turn_direction == "LEFT" else -1.0
+            resultant_dir = 1.0 if self.turn_direction == "LEFT" else (-1.0 if self.turn_direction == "RIGHT" else 0.0)
 
-            # 1. High Priority: Track Parabola if detected
+            # 1. Parabola Steering Mode
             if self.parabola_detected and self.delta_d != float('inf'):
+                self.no_lane_frames = 0
                 status_str = self.apply_parabola_distance_control(resultant_dir)
 
-            # 2. Fallback: Center using edge vectors
-            else:
+            # 2. Vector Centering Mode
+            elif vec_left or vec_right:
+                self.no_lane_frames = 0
                 if vec_left and vec_right:
                     x_l = vec_left[0].x
                     x_r = vec_right[0].x
@@ -153,19 +167,29 @@ class LineFollower(Node):
                     target_center_x = (x_l + x_r) / 2.0
                 elif vec_left:
                     target_center_x = vec_left[0].x + self.d_cached
-                elif vec_right:
-                    target_center_x = vec_right[0].x - self.d_cached
                 else:
-                    target_center_x = rover_center_x
+                    target_center_x = vec_right[0].x - self.d_cached
 
                 dist_error = target_center_x - rover_center_x
                 self.target_turn = -KP_STEER_DIST * dist_error
                 self.target_speed = CRUISE_FORWARD_SPEED
                 status_str = f"VECTOR TRACKING: Err={dist_error:.1f}px"
 
+            # 3. Blind Junction Turn Fallback (No vectors & No Parabola)
+            else:
+                self.no_lane_frames += 1
+                if self.no_lane_frames >= MAX_LOST_FRAMES_THRESHOLD:
+                    self.target_speed = JUNCTION_TURN_SPEED
+                    self.target_turn = resultant_dir * JUNCTION_STEER_MAGNITUDE
+                    status_str = f"⚠️ JUNCTION BLIND TURN ({self.turn_direction}): Steer={self.target_turn:.2f}"
+                else:
+                    self.target_speed = CRUISE_FORWARD_SPEED
+                    self.target_turn = 0.0
+                    status_str = f"COASTING: Searching for lane ({self.no_lane_frames}/{MAX_LOST_FRAMES_THRESHOLD})"
+
         else:
             self.target_speed, self.target_turn = 0.0, 0.0
-            status_str = "STANDBY"
+            status_str = f"STANDBY ({self.mission_state})"
 
         self.render_debug_vectors(img_w, img_h, rover_center_x, status_str)
 
@@ -183,7 +207,8 @@ class LineFollower(Node):
             canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
         cv2.line(canvas, (int(rover_center_x), 0), (int(rover_center_x), img_h), (128, 128, 128), 1)
-        cv2.putText(canvas, status_str, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
+        cv2.putText(canvas, f"STATE: {self.mission_state} | {status_str}", (15, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
 
         try:
             msg = CompressedImage()
@@ -192,22 +217,42 @@ class LineFollower(Node):
             msg.data = np.array(cv2.imencode('.jpg', canvas)[1]).tobytes()
             self.publisher_vector_debug.publish(msg)
         except Exception as e:
-            self.get_logger().error(f"Failed to publish debug vector image: {e}")
+            self.get_logger().error(f"Failed to publish debug image: {e}")
 
+    # ── SEQUENTIAL MISSION STATE MACHINE (Server -> Patient -> Hospital) ──────
     def qr_detection_callback(self, message):
         if not self.is_driving_enabled and not self.has_scanned_active_qr:
             return
-        qr_text = message.data
+
+        qr_text = message.data.strip()
         if qr_text != "":
             self.detected_qr_buffer = qr_text
             self.has_scanned_active_qr = True
+
         elif qr_text == "" and self.has_scanned_active_qr:
-            final_scanned = self.detected_qr_buffer
-            self.get_logger().info(f"🛑 Destination reached! Scanned: '{final_scanned}'")
-            self.is_driving_enabled = False
-            self.target_speed, self.target_turn = 0.0, 0.0
+            scanned_payload = self.detected_qr_buffer
             self.has_scanned_active_qr = False
-            self.send_server_message(text_payload=final_scanned, ack_flag=0)
+
+            # Stage 1: Arrival at Patient Place
+            if self.mission_state == STATE_EN_ROUTE_PATIENT:
+                self.get_logger().info(f"📍 ARRIVED AT PATIENT PLACE: '{scanned_payload}'")
+                self.send_server_message(text_payload=scanned_payload, ack_flag=0)
+
+                # Transition state machine to head toward hospital
+                self.mission_state = STATE_EN_ROUTE_HOSPITAL
+                self.get_logger().info("🏥 MISSION UPDATE: Moving to Hospital Place...")
+                self.is_driving_enabled = True
+
+            # Stage 2: Arrival at Hospital Place
+            elif self.mission_state == STATE_EN_ROUTE_HOSPITAL:
+                self.get_logger().info(f"🏥 ARRIVED AT HOSPITAL PLACE: '{scanned_payload}'")
+                self.send_server_message(text_payload=scanned_payload, ack_flag=0)
+
+                # Stop vehicle motion & return to Idle
+                self.mission_state = STATE_IDLE
+                self.is_driving_enabled = False
+                self.target_speed, self.target_turn = 0.0, 0.0
+                self.get_logger().info("🏁 MISSION COMPLETE! Vehicle stopped.")
 
     def send_server_message(self, text_payload, ack_flag=0, custom_uid=None):
         packet = ServerCommunication()
@@ -222,18 +267,26 @@ class LineFollower(Node):
     def server_communication_callback(self, message):
         if message.dest != BUGGY_ID:
             return
+
         if message.ack == 1:
             if message.uid == self.awaiting_ack_for_uid:
                 self.awaiting_ack_for_uid = None
             return
+
         if message.msg != "":
             self.send_server_message(text_payload="", ack_flag=1, custom_uid=message.uid)
+
             if message.msg == "OK":
                 self.is_driving_enabled = False
                 self.target_speed, self.target_turn = 0.0, 0.0
+                self.mission_state = STATE_IDLE
+
             elif message.msg != "INVALID":
+                # Start Mission Sequence: Server sends initial target
                 self.current_target = message.msg
+                self.mission_state = STATE_EN_ROUTE_PATIENT
                 self.is_driving_enabled = True
+                self.get_logger().info(f"🟢 SERVER INSTRUCTION RECEIVED: En route to Patient ({self.current_target})")
 
 
 def main(args=None):

@@ -1,6 +1,5 @@
 # Copyright 2024-2026 NXP
-# Copyright 2016 Open Source Robotics Foundation, Inc.
-# Parabola perception restricted to bottom 50% image ROI with midpoint partition check
+# Cleaned Edge Vectors Perception Node (No Modes)
 
 import rclpy
 from rclpy.node import Node
@@ -42,9 +41,6 @@ def get_centroid_x(contour):
 
 
 def extract_parabola_centroids(contour, n_bins: int):
-    """
-    Splits lower-ROI contours into horizontal strips to extract clean curve points (x, y).
-    """
     pts_x = contour[:, 0, 0].astype(float)
     pts_y = contour[:, 0, 1].astype(float)
     y_min, y_max = pts_y.min(), pts_y.max()
@@ -64,16 +60,13 @@ def extract_parabola_centroids(contour, n_bins: int):
 
 class EdgeVectorsNode(Node):
     """
-    ROS 2 Node enforcing:
-    1. Parabola extraction ONLY on bottom 50% of image frame.
-    2. Strict frame partitioning: Left lane start < mid_x, Right lane start >= mid_x.
+    ROS 2 Node enforcing lower 50% frame parabola fitting and vector calculation.
     """
     def __init__(self):
         super().__init__('edge_vectors')
 
         # Control & State
         self.is_driving_enabled = False
-        self.current_mode = "DUAL_CENTERING"
         self.turn_direction = "LEFT"
 
         # Publishers
@@ -85,11 +78,10 @@ class EdgeVectorsNode(Node):
 
         # Subscriptions
         self.subscription_image = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.image_callback, QOS_PROFILE_DEFAULT)
-        self.subscription_mode = self.create_subscription(String, '/driving_mode', self.mode_callback, QOS_PROFILE_DEFAULT)
         self.subscription_sign = self.create_subscription(String, '/sign_board_detection', self.sign_callback, QOS_PROFILE_DEFAULT)
         self.subscription_server = self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_callback, QOS_PROFILE_DEFAULT)
 
-        self.get_logger().info("🏎️ Lower 50% Parabola Lane Perception Node Active")
+        self.get_logger().info("🏎️ Lower 50% Parabola Perception Node Operational")
 
     def server_callback(self, msg):
         if msg.dest == BUGGY_ID and msg.msg not in ["", "OK", "INVALID"]:
@@ -100,18 +92,9 @@ class EdgeVectorsNode(Node):
             self.is_driving_enabled = False
             self.get_logger().info("🔴 SERVER STOP: Perception Standby.")
 
-    def mode_callback(self, msg):
-        raw_mode = msg.data.strip().upper()
-        if "TURNING" in raw_mode:
-            self.current_mode = "TURNING"
-        else:
-            self.current_mode = "DUAL_CENTERING"
-
     def sign_callback(self, msg):
-        if not self.is_driving_enabled:
-            return
         direction = msg.data.strip().upper()
-        if direction in ["LEFT", "RIGHT"]:
+        if direction in ["LEFT", "RIGHT", "STRAIGHT"]:
             self.turn_direction = direction
 
     def _publish_compressed(self, publisher, cv_img):
@@ -137,16 +120,16 @@ class EdgeVectorsNode(Node):
             h_full, w_full = cv_image.shape[:2]
             frame_center_x = w_full / 2.0
 
-            # ── 1. Restrict ROI to Lower 50% of Frame ────────────────────────
+            # ── 1. Restrict ROI to Lower 50% Frame ───────────────────────────
             x_lo, x_hi = BORDER_STRIP_PX, w_full - BORDER_STRIP_PX
-            roi_top_y = int(h_full * ROI_TOP_FRAC)       # 50% y-level
-            roi_bot_y = int(h_full * ROI_BOTTOM_FRAC)    # 98% y-level
+            roi_top_y = int(h_full * ROI_TOP_FRAC)
+            roi_bot_y = int(h_full * ROI_BOTTOM_FRAC)
 
             roi = cv_image[roi_top_y:roi_bot_y, x_lo:x_hi].copy()
             roi_h, roi_w = roi.shape[:2]
             roi_mid_x = roi_w / 2.0
 
-            # ── 2. Segmentation (HSV + LAB Black Line Thresholding) ───────────
+            # ── 2. Segmentation ───────────────────────────────────────────────
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             mask_hsv = cv2.inRange(hsv, LANE_BLACK_HSV_LOWER, LANE_BLACK_HSV_UPPER)
             lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
@@ -163,11 +146,10 @@ class EdgeVectorsNode(Node):
             vectors = []
             debug_canvas = cv_image.copy()
 
-            # Draw visual boundaries on canvas
-            cv2.line(debug_canvas, (0, roi_top_y), (w_full, roi_top_y), (255, 255, 0), 1)  # ROI 50% Line
-            cv2.line(debug_canvas, (int(frame_center_x), roi_top_y), (int(frame_center_x), h_full), (0, 255, 255), 1)  # Mid partition
+            cv2.line(debug_canvas, (0, roi_top_y), (w_full, roi_top_y), (255, 255, 0), 1)
+            cv2.line(debug_canvas, (int(frame_center_x), roi_top_y), (int(frame_center_x), h_full), (0, 255, 255), 1)
 
-            # ── 3. Parabola Fitting in Lower 50% Frame ────────────────────────
+            # ── 3. Parabola Fitting ───────────────────────────────────────────
             for side in ['left', 'right']:
                 side_cnts = [c for c in valid_cnts if (get_centroid_x(c) < roi_mid_x if side == 'left' else get_centroid_x(c) >= roi_mid_x)]
 
@@ -180,29 +162,21 @@ class EdgeVectorsNode(Node):
                 if len(centroids) < MIN_POLY_POINTS:
                     continue
 
-                # Map ROI centroids back to full frame Y and X pixel values
                 ys = np.array([pt[1] + roi_top_y for pt in centroids], dtype=np.float64)
                 xs = np.array([pt[0] + x_lo for pt in centroids], dtype=np.float64)
 
-                # Parabola equation: x = A*y^2 + B*y + C
                 coeffs = np.polyfit(ys, xs, 2)
                 A, B, C = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
 
-                # Evaluate bottom (start) & top endpoints within lower ROI
                 eval_y_bot = float(roi_bot_y)
                 eval_y_top = float(roi_top_y)
                 eval_x_bot = (A * (eval_y_bot ** 2)) + (B * eval_y_bot) + C
                 eval_x_top = (A * (eval_y_top ** 2)) + (B * eval_y_top) + C
 
-                # ── Spatial Partition Validation ──────────────────────────────
                 if side == 'left' and eval_x_bot >= frame_center_x:
-                    self.get_logger().warn("Rejected Left Parabola: Start point crossed right partition.")
                     continue
-
                 if side == 'right' and eval_x_bot < frame_center_x:
-                    self.get_logger().warn("Rejected Right Parabola: Start point crossed left partition.")
                     continue
-                # ──────────────────────────────────────────────────────────────
 
                 vec_bot = (eval_x_bot, eval_y_bot)
                 vec_top = (eval_x_top, eval_y_top)
@@ -210,7 +184,6 @@ class EdgeVectorsNode(Node):
 
                 curve_data[side] = {'A': A, 'B': B, 'C': C}
 
-                # Render Parabola inside bottom 50%
                 y_samples = np.linspace(roi_top_y, roi_bot_y, 25)
                 x_samples = (A * (y_samples ** 2)) + (B * y_samples) + C
                 pts = np.column_stack((x_samples, y_samples)).astype(np.int32)
@@ -219,10 +192,8 @@ class EdgeVectorsNode(Node):
                     line_color = (255, 0, 0) if side == 'left' else (0, 0, 255)
                     cv2.polylines(debug_canvas, [pts], isClosed=False, color=line_color, thickness=3)
 
-                # Draw verified starting point marker
                 cv2.circle(debug_canvas, (int(eval_x_bot), int(eval_y_bot)), 5, (0, 255, 0), -1)
 
-                # Publish Parabola metadata for turning logic
                 if side == self.turn_direction.lower():
                     eval_y_lookahead = roi_top_y + (roi_h * 0.4)
                     target_x_lane = (A * (eval_y_lookahead ** 2)) + (B * eval_y_lookahead) + C
@@ -240,15 +211,15 @@ class EdgeVectorsNode(Node):
                     })
                     self.publisher_parabola.publish(String(data=parabola_payload))
 
-            # ── 4. Publish EdgeVectors ────────────────────────────────────────
+            # ── 4. Publish Edge Vectors ───────────────────────────────────────
             vm = EdgeVectors()
             vm.image_height, vm.image_width = h_full, w_full
             vm.vector_count = len(vectors)
 
             for i, vec in enumerate(vectors):
                 target_vec = vm.vector_1 if i == 0 else vm.vector_2
-                target_vec[0].x, target_vec[0].y = map(float, vec[1])  # Bottom start
-                target_vec[1].x, target_vec[1].y = map(float, vec[2])  # Top end (at 50% image level)
+                target_vec[0].x, target_vec[0].y = map(float, vec[1])
+                target_vec[1].x, target_vec[1].y = map(float, vec[2])
 
             self.publisher_vectors.publish(vm)
 
@@ -256,12 +227,11 @@ class EdgeVectorsNode(Node):
             cm.data = json.dumps(curve_data)
             self.publisher_curves.publish(cm)
 
-            # Debug Visualizations
             self._publish_compressed(self.publisher_thresh, thresh)
             self._publish_compressed(self.publisher_debug, debug_canvas)
 
         except Exception as e:
-            self.get_logger().error(f"Error in lower 50% image processing: {e}")
+            self.get_logger().error(f"Error in image processing: {e}")
 
 
 def main(args=None):

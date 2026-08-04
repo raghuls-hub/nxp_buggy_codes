@@ -1,5 +1,5 @@
 # Copyright 2024-2026 NXP
-# Copyright 2016 Open Source Robotics Foundation, Inc.
+# Cleaned Signboard Recognizer: Continuous Detection (No Mode-Locking)
 
 import rclpy
 from rclpy.node import Node
@@ -21,22 +21,18 @@ REQUIRED_CONTINUOUS_FRAMES = 8   # Frames required to lock onto a front board
 # Spatial ROI Boundaries (Fraction of Frame Dimensions)
 ROI_ENTRY_FRAC  = 0.05           # Top Y boundary
 ROI_EXIT_FRAC   = 0.90           # Bottom Y boundary
-ROI_X_LEFT_FRAC = 0.22           # Left X boundary (Ignores left-lane signboards)
-ROI_X_RIGHT_FRAC= 0.78           # Right X boundary (Ignores right-lane signboards)
+ROI_X_LEFT_FRAC = 0.22           # Left X boundary
+ROI_X_RIGHT_FRAC= 0.78           # Right X boundary
 
 
 class ObjectRecognizer(Node):
     """
     ROS 2 Node for Junction Signboard Detection:
-    - Constrained X/Y ROI bounding box to focus exclusively on current lane signboards.
-    - Pauses detection automatically when buggy enters TURNING mode.
+    - Continuous frame scanning (Modes removed).
     - Locks onto front-facing boards and publishes direction payload upon crossing.
     """
     def __init__(self):
         super().__init__('object_recognizer')
-
-        # Mode Tracking
-        self.current_driving_mode = "DUAL_CENTERING"
 
         # Detection State Machine Flags
         self.continuous_frame_count = 0
@@ -55,21 +51,8 @@ class ObjectRecognizer(Node):
         # Subscriptions
         self.create_subscription(
             CompressedImage, '/camera/image_raw/compressed', self.image_callback, QOS_PROFILE_DEFAULT)
-        self.create_subscription(
-            String, '/driving_mode', self.driving_mode_callback, QOS_PROFILE_DEFAULT)
 
-        self.get_logger().info("🚦 ROI-Constrained Signboard Recognizer Operational.")
-
-    def driving_mode_callback(self, msg):
-        """Disables/Enables signboard detection depending on driving mode."""
-        new_mode = msg.data.strip().upper()
-        if new_mode != self.current_driving_mode:
-            self.current_driving_mode = new_mode
-            if self.current_driving_mode == "TURNING":
-                self.get_logger().info("⏸️ TURNING mode active: Signboard detection PAUSED.")
-                self.reset_detection_state()
-            else:
-                self.get_logger().info("▶️ DUAL_CENTERING mode active: Signboard detection RESUMED.")
+        self.get_logger().info("🚦 Continuous Signboard Recognizer Operational.")
 
     def order_points(self, pts):
         rect = np.zeros((4, 2), dtype="float32")
@@ -178,23 +161,15 @@ class ObjectRecognizer(Node):
             h_full, w_full = cv_image.shape[:2]
             debug_img = cv_image.copy()
 
-            # Define Spatial ROI Window (Center-Lane Focused)
+            # Define Spatial ROI Window
             roi_top_y   = int(h_full * ROI_ENTRY_FRAC)
             roi_bot_y   = int(h_full * ROI_EXIT_FRAC)
             roi_left_x  = int(w_full * ROI_X_LEFT_FRAC)
             roi_right_x = int(w_full * ROI_X_RIGHT_FRAC)
 
-            # Draw ROI Bounding Window
             cv2.rectangle(debug_img, (roi_left_x, roi_top_y), (roi_right_x, roi_bot_y), (255, 255, 0), 2)
 
-            # ── IF BUGGY IS TURNING: SUPPRESS DETECTION ──
-            if self.current_driving_mode == "TURNING":
-                cv2.putText(debug_img, "DETECTION PAUSED (TURNING MODE)", (roi_left_x + 10, roi_top_y + 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                self.publish_debug_image(debug_img)
-                return
-
-            # Color Thresholding
+            # Color Thresholding for Signboard Detection
             hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
             lower_green = np.array([35, 40, 40])
             upper_green = np.array([85, 255, 255])
@@ -211,7 +186,6 @@ class ObjectRecognizer(Node):
                 cx = x + (bw / 2.0)
                 cy = y + (bh / 2.0)
 
-                # Filter strictly within current lane X and Y spatial bounds
                 if (roi_top_y <= cy <= roi_bot_y) and (roi_left_x <= cx <= roi_right_x):
                     is_front, dir_extracted, warped_roi = self.inspect_and_extract_board(cv_image, cnt)
 
